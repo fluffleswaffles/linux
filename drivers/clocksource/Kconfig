@@ -134,6 +134,12 @@ config RDA_TIMER
 	help
 	  Enables the support for the RDA Micro timer driver.
 
+config RAPUYAMA_TIMER
+	bool "Nokia RapuYama timer driver" if COMPILE_TEST
+	select TIMER_OF
+	help
+	  Enables the ms timer and the 32 kHz counter of the Nokia RapuYama SoC.
+
 config REALTEK_OTTO_TIMER
 	bool "Clocksource/timer for the Realtek Otto platform" if COMPILE_TEST
 	select TIMER_OF

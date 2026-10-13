@@ -228,6 +228,10 @@ config RDA_INTC
 	bool
 	select IRQ_DOMAIN
 
+config RAPUYAMA_INTC
+	bool
+	select IRQ_DOMAIN_HIERARCHY
+
 config RENESAS_INTC_IRQPIN
 	bool "Renesas INTC External IRQ Pin Support" if COMPILE_TEST
 	select IRQ_DOMAIN

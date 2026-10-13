@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config ARCH_RAPUYAMA
+	bool "Nokia RapuYama (N8/E6/E7/C7)"
+	depends on ARCH_MULTI_V6
+	select RAPUYAMA_INTC
+	select RAPUYAMA_TIMER
+	select GPIOLIB
+	select COMMON_CLK
+	imply GPIO_RAPUYAMA
+	imply I2C
+	imply I2C_OMAP
+	imply WATCHDOG
+	imply RAPUYAMA_WATCHDOG
+	imply SERIAL_RAPUYAMA_EARLYCON
+	help
+	  Support for the Nokia RapuYama application ASIC (ARM1176JZF-S)
+	  used in the Symbian^3 phones N8, E6, E7 and C7. The i2c block is
+	  the TI OMAP one (omap2420 layout), so it uses i2c-omap.

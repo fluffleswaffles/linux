@@ -563,6 +563,15 @@ config S3C2410_WATCHDOG
 	  The driver can be built as a module by choosing M, and will
 	  be called s3c2410_wdt.
 
+config RAPUYAMA_WATCHDOG
+	tristate "Nokia RapuYama watchdog"
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	select WATCHDOG_CORE
+	help
+	  Keeps the PMIC (Retu style, over the SoC CBUS master) and SoC
+	  watchdogs of the Nokia RapuYama phones (N8/E6/E7/C7) fed. Symbian
+	  leaves them running, without this the phone powers off after ~48 s.
+
 config SA1100_WATCHDOG
 	tristate "SA1100/PXA2xx watchdog"
 	depends on ARCH_SA1100 || ARCH_PXA || COMPILE_TEST

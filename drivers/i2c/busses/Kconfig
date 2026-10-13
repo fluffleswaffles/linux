@@ -934,7 +934,7 @@ config I2C_OCORES
 
 config I2C_OMAP
 	tristate "OMAP I2C adapter"
-	depends on ARCH_OMAP || ARCH_K3 || COMPILE_TEST
+	depends on ARCH_OMAP || ARCH_K3 || ARCH_RAPUYAMA || COMPILE_TEST
 	default MACH_OMAP_OSK
 	help
 	  If you say yes to this option, support will be included for the

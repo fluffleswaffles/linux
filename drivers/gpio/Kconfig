@@ -571,6 +571,16 @@ config GPIO_RDA
 	help
 	  Say Y here to support RDA Micro GPIO controller.
 
+config GPIO_RAPUYAMA
+	bool "Nokia RapuYama GPIO controller support"
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	depends on OF_GPIO
+	select GPIOLIB_IRQCHIP
+	select IRQ_DOMAIN_HIERARCHY
+	help
+	  Say Y here to support the GPIO banks of the Nokia RapuYama SoC
+	  (N8/E6/E7/C7).
+
 config GPIO_REALTEK_OTTO
 	tristate "Realtek Otto GPIO support"
 	depends on MACH_REALTEK_RTL

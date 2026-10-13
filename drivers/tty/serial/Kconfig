@@ -73,6 +73,17 @@ config SERIAL_AMBA_PL011_CONSOLE
 	  your boot loader (lilo or loadlin) about how to pass options to the
 	  kernel at boot time.)
 
+config SERIAL_RAPUYAMA_EARLYCON
+	bool "Early console on the Nokia RapuYama UART"
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	select SERIAL_CORE
+	select SERIAL_CORE_CONSOLE
+	select SERIAL_EARLYCON
+	help
+	  Polled early console on the (bluetooth) uart of the Nokia RapuYama
+	  phones (N8/E6/E7/C7), for bring-up over the BT uart test pads.
+	  Use "earlycon=rapuyama,0x20025a00,115200 keep_bootcon".
+
 config SERIAL_EARLYCON_SEMIHOST
 	bool "Early console using Arm compatible semihosting"
 	depends on ARM64 || ARM || RISCV

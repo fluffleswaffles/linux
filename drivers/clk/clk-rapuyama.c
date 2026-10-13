@@ -23,6 +23,7 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -39,6 +40,7 @@ struct ry_gate_desc {
 	u16 reg;
 	u16 mask;
 	u8 pol;
+	bool settle;	/* power domain, give it time after switching on */
 };
 
 /* gate id -> reg, from power_resources 0x800c7104.. (FUN_800c7534 calls) */
@@ -58,6 +60,12 @@ static const struct ry_gate_desc ry_gates[RY_GATE_MAX] = {
 	[0x12] = { 0x1b0, 0x0010, 1 },
 	[0x13] = { 0x1b0, 0x0020, 1 },
 	[0x14] = { 0x1b0, 0x0040, 1 },
+	/*
+	 * hs usb power domains (FUN_800c7634): same set/clear reg pair, the
+	 * firmware then waits for a done irq (0x114/0x115), a delay does here
+	 */
+	[0x15] = { 0x250, 0x2000, 0, true },
+	[0x16] = { 0x250, 0x1000, 0, true },
 	[0x17] = { 0x190, 0x0020, 1 },
 	[0x18] = { 0x190, 0x0102, 1 },
 	[0x19] = { 0x190, 0x0004, 1 },
@@ -151,11 +159,17 @@ static int ry_clk_enable(struct clk_hw *hw)
 	unsigned long flags;
 	int i;
 
-	spin_lock_irqsave(&ry_cgc_lock, flags);
-	for (i = 0; i < 3; i++)
-		if (ry_gate_known(c->res->gate[i]))
-			ry_gate_write(c->base, c->res->gate[i], true);
-	spin_unlock_irqrestore(&ry_cgc_lock, flags);
+	for (i = 0; i < 3; i++) {
+		u8 g = c->res->gate[i];
+
+		if (!ry_gate_known(g))
+			continue;
+		spin_lock_irqsave(&ry_cgc_lock, flags);
+		ry_gate_write(c->base, g, true);
+		spin_unlock_irqrestore(&ry_cgc_lock, flags);
+		if (ry_gates[g].settle)
+			udelay(500);
+	}
 	return 0;
 }
 

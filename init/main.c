@@ -13,6 +13,14 @@
 #define DEBUG		/* Enable initcall_debug */
 
 #include <linux/types.h>
+
+#ifdef CONFIG_ARCH_RAPUYAMA
+/* bring-up checkpoints, see arch/arm/mach-rapuyama/rapuyama.c (e6.stop=N) */
+void rapuyama_checkpoint(int n);
+#define E6_CP(n) rapuyama_checkpoint(n)
+#else
+#define E6_CP(n) do { } while (0)
+#endif
 #include <linux/extable.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
@@ -923,6 +931,7 @@ void start_kernel(void)
 	page_address_init();
 	pr_notice("%s", linux_banner);
 	setup_arch(&command_line);
+	E6_CP(1);
 	/* Static keys and static calls are needed by LSMs */
 	jump_label_init();
 	static_call_init();
@@ -1006,6 +1015,7 @@ void start_kernel(void)
 	/* init some links before init_ISA_irqs() */
 	early_irq_init();
 	init_IRQ();
+	E6_CP(2);
 	tick_init();
 	rcu_init_nohz();
 	init_timers();
@@ -1014,6 +1024,7 @@ void start_kernel(void)
 	softirq_init();
 	timekeeping_init();
 	time_init();
+	E6_CP(3);
 
 	/* This must be after timekeeping is initialized */
 	random_init();
@@ -1029,6 +1040,7 @@ void start_kernel(void)
 
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
+	E6_CP(4);
 
 	kmem_cache_init_late();
 
@@ -1038,6 +1050,7 @@ void start_kernel(void)
 	 * this. But we do want output early, in case something goes wrong.
 	 */
 	console_init();
+	E6_CP(5);
 	if (panic_later)
 		panic("Too many boot %s vars at `%s'", panic_later,
 		      panic_param);
@@ -1067,6 +1080,7 @@ void start_kernel(void)
 		late_time_init();
 	sched_clock_init();
 	calibrate_delay();
+	E6_CP(6);
 
 	arch_cpu_finalize_init();
 
@@ -1466,6 +1480,7 @@ static int __ref kernel_init(void *unused)
 	 */
 	wait_for_completion(&kthreadd_done);
 
+	E6_CP(7);
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
@@ -1492,6 +1507,7 @@ static int __ref kernel_init(void *unused)
 	do_sysctl_args();
 
 	if (ramdisk_execute_command) {
+		E6_CP(10);
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
 			return 0;
@@ -1577,7 +1593,9 @@ static noinline void __init kernel_init_freeable(void)
 	padata_init();
 	page_alloc_init_late();
 
+	E6_CP(8);
 	do_basic_setup();
+	E6_CP(9);
 
 	kunit_run_all_tests();
 

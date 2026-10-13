@@ -90,9 +90,18 @@ static struct clock_event_device rapuyama_mst_ced = {
 	.set_state_shutdown	= rapuyama_mst_shutdown,
 };
 
+#ifdef CONFIG_ARCH_RAPUYAMA
+void rapuyama_checkpoint(int n);
+#else
+static inline void rapuyama_checkpoint(int n) { }
+#endif
+
 static irqreturn_t rapuyama_mst_irq(int irq, void *dev_id)
 {
 	struct clock_event_device *evt = dev_id;
+
+	/* checkpoint 11: a real timer interrupt arrived (e6.stop=11) */
+	rapuyama_checkpoint(11);
 
 	/* the firmware isr does this before NTimerQ::Tick, acts as the ack */
 	if (clockevent_state_periodic(evt))

@@ -184,6 +184,36 @@
 		 * As of today (2014) that's exactly the members of the A and R
 		 * classes.
 		 */
+
+#if defined(E6_CP_ENTRY) || defined(E6_CP_ENTER)
+		/*
+		 * Nokia RapuYama bring-up probe (build with KAFLAGS=-DE6_CP_...):
+		 * power the phone off right here through the pmic watchdog over
+		 * cbus, phys addresses, mmu off. clobbers r9-r12, never returns
+		 */
+		.macro	e6_pmic_off
+		ldr	r9, =0x20030700
+		mov	r10, #1
+		str	r10, [r9, #0x04]	@ cbus enable
+		str	r10, [r9, #0x3c]	@ write mode
+		mov	r10, #15
+		str	r10, [r9, #0x2c]	@ 16 bits
+		mov	r10, #0
+		str	r10, [r9, #0x20]	@ data 0 = expire now
+		mov	r10, #0x57		@ dev 1 reg 0x17
+		str	r10, [r9, #0x1c]	@ go
+		ldr	r11, =0x10000
+1001:		ldr	r10, [r9, #0x08]
+		cmp	r10, #0
+		beq	1002f
+		subs	r11, r11, #1
+		bne	1001b
+1002:		mov	r10, #0
+		str	r10, [r9, #0x04]
+1003:		b	1003b
+		.ltorg
+		.endm
+#endif
  AR_CLASS(	.arm	)
 start:
 		.type	start,#function
@@ -209,6 +239,9 @@ start:
  AR_CLASS(	sub	pc, pc, #3	)	@ A/R: switch to Thumb2 mode
   M_CLASS(	nop.w			)	@ M: already in Thumb2 mode
 		.thumb
+#endif
+#ifdef E6_CP_ENTRY
+		W(b)	e6_entry_probe
 #endif
 		W(b)	1f
 
@@ -1432,12 +1465,20 @@ __hyp_reentry_vectors:
 #endif /* CONFIG_ARM_VIRT_EXT */
 
 __enter_kernel:
+#ifdef E6_CP_ENTER
+		e6_pmic_off
+#endif
 		mov	r0, #0			@ must be 0
 		mov	r1, r7			@ restore architecture number
 		mov	r2, r8			@ restore atags pointer
  ARM(		mov	pc, r4		)	@ call kernel
  M_CLASS(	add	r4, r4, #1	)	@ enter in Thumb mode for M class
  THUMB(		bx	r4		)	@ entry point is always ARM for A/R classes
+
+#ifdef E6_CP_ENTRY
+e6_entry_probe:
+		e6_pmic_off
+#endif
 
 reloc_code_end:
 

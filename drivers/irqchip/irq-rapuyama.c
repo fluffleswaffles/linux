@@ -36,10 +36,29 @@
 #define INTC_FIQ_NEST		0x9c
 
 #define INTC_NR_IRQS		421	/* firmware checks n <= 0x1a4 */
+
+/*
+ * the gpio / peripheral secondary interrupt banks, in the clock-power block
+ * (phys 0x20033400 + 0x40 * k). firmware FUN_800b8b18 masks all of them at
+ * init (write ~0 to bank+0x14, drain bank+0x28 until -1), otherwise a source
+ * symbian left enabled keeps asserting the main line -> irq storm the moment
+ * interrupts are turned on (died exactly at local_irq_enable without this)
+ */
+#define INTC_SEC_STRIDE		0x40
+#define INTC_SEC_DIS		0x14	/* write ~0 to disable every line in the bank */
+#define INTC_SEC_NUM		0x28	/* read until -1 to drain */
+#define INTC_SEC_BANKS		5
 #define INTC_DEF_PRIO		2	/* what Interrupt::Bind uses */
 #define INTC_NONE		(~0u)
 
+#ifdef CONFIG_ARCH_RAPUYAMA
+void rapuyama_checkpoint(int n);
+#else
+static inline void rapuyama_checkpoint(int n) { }
+#endif
+
 static void __iomem *intc_base;
+static void __iomem *intc_sec;	/* secondary (gpio/periph) banks, optional */
 static struct irq_domain *intc_domain;
 
 static void rapuyama_intc_mask(struct irq_data *d)
@@ -89,10 +108,29 @@ static const struct irq_domain_ops rapuyama_intc_ops = {
 
 static void __exception_irq_entry rapuyama_intc_handle_irq(struct pt_regs *regs)
 {
+	int guard = 2 * INTC_NR_IRQS;
 	u32 hw;
 
-	while ((hw = readl_relaxed(intc_base + INTC_IRQ_NUM)) != INTC_NONE)
-		generic_handle_domain_irq(intc_domain, hw);
+	/* cp20: first entry into the intc handler = an interrupt was delivered */
+	rapuyama_checkpoint(20);
+
+	/*
+	 * read the pending line, dispatch, read the eoi (+0x80). bounded so a
+	 * line that keeps re-asserting (bad source ack, or a line with no linux
+	 * handler) can't lock the cpu forever: after too many iterations we
+	 * mask that line at the main bank and bail, which keeps the kernel
+	 * alive and makes a stuck source obvious instead of a silent hang.
+	 */
+	while ((hw = readl_relaxed(intc_base + INTC_IRQ_NUM)) != INTC_NONE) {
+		pr_info_once("rapuyama-intc: first irq hwirq=%u\n", hw);
+		if (hw >= INTC_NR_IRQS ||
+		    generic_handle_domain_irq(intc_domain, hw) || --guard <= 0) {
+			writel_relaxed(hw, intc_base + INTC_IRQ_MASK);
+			if (guard <= 0)
+				break;
+		}
+		readl_relaxed(intc_base + INTC_IRQ_END);
+	}
 	readl_relaxed(intc_base + INTC_IRQ_END);
 }
 
@@ -108,6 +146,7 @@ static void rapuyama_intc_drain(unsigned int num_reg)
 static int __init rapuyama_intc_of_init(struct device_node *node,
 					struct device_node *parent)
 {
+	pr_info("rapuyama-intc: probe, parent=%p\n", parent);
 	intc_base = of_iomap(node, 0);
 	if (!intc_base)
 		return -ENOMEM;
@@ -120,6 +159,25 @@ static int __init rapuyama_intc_of_init(struct device_node *node,
 	rapuyama_intc_drain(INTC_IRQ_NUM);
 	writel_relaxed(INTC_NONE, intc_base + INTC_FIQ_MASK);
 	rapuyama_intc_drain(INTC_FIQ_NUM);
+
+	/*
+	 * mask + drain the secondary gpio/peripheral banks, else a source
+	 * symbian left enabled storms the main line at local_irq_enable
+	 */
+	intc_sec = of_iomap(node, 1);
+	if (intc_sec) {
+		int b, n;
+
+		for (b = 0; b < INTC_SEC_BANKS; b++) {
+			void __iomem *bank = intc_sec + b * INTC_SEC_STRIDE;
+
+			writel_relaxed(INTC_NONE, bank + INTC_SEC_DIS);
+			n = INTC_NR_IRQS;
+			while (n-- && readl_relaxed(bank + INTC_SEC_NUM) != INTC_NONE)
+				;
+		}
+	}
+
 	writel_relaxed(0, intc_base + INTC_IRQ_NEST);
 	writel_relaxed(0, intc_base + INTC_FIQ_NEST);
 
@@ -132,6 +190,7 @@ static int __init rapuyama_intc_of_init(struct device_node *node,
 	}
 
 	set_handle_irq(rapuyama_intc_handle_irq);
+	pr_info("rapuyama-intc: domain=%p ready, handler installed\n", intc_domain);
 	return 0;
 }
 IRQCHIP_DECLARE(rapuyama_intc, "nokia,rapuyama-intc", rapuyama_intc_of_init);

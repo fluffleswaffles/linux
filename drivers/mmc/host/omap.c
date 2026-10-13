@@ -1373,6 +1373,22 @@ static int mmc_omap_probe(struct platform_device *pdev)
 	int i, ret = 0;
 	int irq;
 
+	if (pdata == NULL && pdev->dev.of_node) {
+		/* one slot described in dt (Nokia RapuYama has no board file) */
+		u32 width = 4, freq = 24000000;
+
+		pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+		if (!pdata)
+			return -ENOMEM;
+		of_property_read_u32(pdev->dev.of_node, "bus-width", &width);
+		of_property_read_u32(pdev->dev.of_node, "max-frequency", &freq);
+		pdata->nr_slots = 1;
+		pdata->max_freq = freq;
+		pdata->slots[0].wires = width;
+		pdata->slots[0].name = "mmcblk";
+		pdata->slots[0].ocr_mask = MMC_VDD_32_33 | MMC_VDD_33_34;
+		pdev->dev.platform_data = pdata;
+	}
 	if (pdata == NULL) {
 		dev_err(&pdev->dev, "platform data missing\n");
 		return -ENXIO;

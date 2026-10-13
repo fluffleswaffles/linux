@@ -510,7 +510,7 @@ config MMC_SDHCI_ST
 
 config MMC_OMAP
 	tristate "TI OMAP Multimedia Card Interface support"
-	depends on ARCH_OMAP
+	depends on ARCH_OMAP || ARCH_RAPUYAMA
 	help
 	  This selects the TI OMAP Multimedia card Interface.
 	  If you have an OMAP board with a Multimedia Card slot,

@@ -12,11 +12,16 @@
  *   sisa_wrapper does "force power off"), so 0 is never written here.
  * - a SoC counter at 0x200336c4 that gets 0x3fffffff on every kick.
  *
- * The CBUS master (karap 0x800b8414/0x800b8494) is a register block:
+ * The CBUS master (karap 0x800b8414/0x800b8494, base pointer 0x20030704 in
+ * the firmware, offsets here are from 0x20030700):
  *   0x04 enable (1 around a transfer)   0x08 busy
- *   0x14 read cmd  (dev << 6 | reg | 0x20)
- *   0x18 write cmd (dev << 6 | reg)     0x1c data
- *   0x28 bit count - 1                  0x38 1 before a write
+ *   0x18 read cmd  (dev << 6 | reg | 0x20)
+ *   0x1c write cmd (dev << 6 | reg)     0x20 data
+ *   0x2c bit count - 1                  0x3c 1 before a write
+ * (first version had all of these 4 bytes low, which wrote the data into the
+ * write cmd reg and powered the phone off)
+ *
+ * Restart (optional third reg, rebootdriver.ldd): write 2 to 0x20033114.
  *
  * Both run from the moment symbian booted us, so the device is marked as
  * running and the watchdog core keeps it fed until userspace takes over.
@@ -27,16 +32,17 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/reboot.h>
 #include <linux/spinlock.h>
 #include <linux/watchdog.h>
 
 #define CBUS_EN		0x04
 #define CBUS_BUSY	0x08
-#define CBUS_RD_CMD	0x14
-#define CBUS_WR_CMD	0x18
-#define CBUS_DATA	0x1c
-#define CBUS_BITS	0x28
-#define CBUS_WR_MODE	0x38
+#define CBUS_RD_CMD	0x18
+#define CBUS_WR_CMD	0x1c
+#define CBUS_DATA	0x20
+#define CBUS_BITS	0x2c
+#define CBUS_WR_MODE	0x3c
 #define CBUS_READ	0x20
 #define CBUS_TRIES	0x800
 
@@ -46,13 +52,23 @@
 #define PMIC_WDT_DEF	48	/* what symbian uses */
 
 #define SOC_WDT_RELOAD	0x3fffffff
+/*
+ * symbian kicks every 3 s. the soc counter runs out much sooner than the
+ * pmic one: the first linux boot that kicked only every 24 s (timeout / 2)
+ * got a soc reset ~13 s in, so the core has to ping at symbian's pace
+ */
+#define RY_HW_HEARTBEAT_MS	3000
 
 struct rapuyama_wdt {
 	struct watchdog_device wdd;
 	void __iomem *cbus;
 	void __iomem *soc;
+	void __iomem *reset;	/* optional */
 	spinlock_t lock;
 };
+
+/* rebootdriver.ldd 0x800cd0bc: irqs off, write 2, spin */
+#define SOC_RESET_VAL	2
 
 static int rapuyama_cbus_wait(struct rapuyama_wdt *rw)
 {
@@ -102,6 +118,31 @@ static int rapuyama_wdt_set_timeout(struct watchdog_device *wdd,
 	return rapuyama_wdt_ping(wdd);
 }
 
+/*
+ * power off = expire the pmic watchdog right now, same as symbian's sisa
+ * "force power off" and mainline retu-mfd's retu_power_off
+ */
+static int rapuyama_wdt_power_off(struct sys_off_data *data)
+{
+	struct rapuyama_wdt *rw = data->cb_data;
+
+	rapuyama_cbus_write(rw, PMIC_DEV, PMIC_REG_WDT, 0);
+	for (;;)
+		cpu_relax();
+	return NOTIFY_DONE;
+}
+
+static int rapuyama_wdt_restart(struct sys_off_data *data)
+{
+	struct rapuyama_wdt *rw = data->cb_data;
+
+	local_irq_disable();
+	writel(SOC_RESET_VAL, rw->reset);
+	for (;;)
+		cpu_relax();
+	return NOTIFY_DONE;
+}
+
 static const struct watchdog_info rapuyama_wdt_info = {
 	.options	= WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING,
 	.identity	= "RapuYama PMIC watchdog",
@@ -130,6 +171,9 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	rw->soc = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(rw->soc))
 		return PTR_ERR(rw->soc);
+	rw->reset = devm_platform_ioremap_resource(pdev, 2);
+	if (IS_ERR(rw->reset))
+		rw->reset = NULL;
 
 	spin_lock_init(&rw->lock);
 
@@ -138,6 +182,7 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	rw->wdd.min_timeout = 1;
 	rw->wdd.max_timeout = PMIC_WDT_MAX;
 	rw->wdd.timeout = PMIC_WDT_DEF;
+	rw->wdd.max_hw_heartbeat_ms = RY_HW_HEARTBEAT_MS;
 	rw->wdd.parent = dev;
 	watchdog_init_timeout(&rw->wdd, 0, dev);
 	watchdog_set_nowayout(&rw->wdd, true);
@@ -152,6 +197,20 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	ret = devm_watchdog_register_device(dev, &rw->wdd);
 	if (ret)
 		return ret;
+
+	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
+					    SYS_OFF_PRIO_DEFAULT,
+					    rapuyama_wdt_power_off, rw);
+	if (ret)
+		dev_warn(dev, "no power off handler: %d\n", ret);
+
+	if (rw->reset) {
+		ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_RESTART,
+						    SYS_OFF_PRIO_DEFAULT,
+						    rapuyama_wdt_restart, rw);
+		if (ret)
+			dev_warn(dev, "no restart handler: %d\n", ret);
+	}
 
 	dev_info(dev, "pmic + soc watchdog, %u s\n", rw->wdd.timeout);
 	return 0;
@@ -170,7 +229,15 @@ static struct platform_driver rapuyama_wdt_driver = {
 		.of_match_table = rapuyama_wdt_of_match,
 	},
 };
-module_platform_driver(rapuyama_wdt_driver);
+/*
+ * early, so the soc watchdog (~13 s) gets fed before slow or risky drivers
+ * (usb, i2c) probe and a crash in one of them isn't hidden behind a reset
+ */
+static int __init rapuyama_wdt_init(void)
+{
+	return platform_driver_register(&rapuyama_wdt_driver);
+}
+subsys_initcall(rapuyama_wdt_init);
 
 MODULE_DESCRIPTION("Nokia RapuYama watchdog driver");
 MODULE_LICENSE("GPL");

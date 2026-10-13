@@ -104,6 +104,12 @@ config USB_MUSB_JZ4740
 	depends on USB_MUSB_GADGET
 	select USB_ROLE_SWITCH
 
+config USB_MUSB_RAPUYAMA
+	tristate "Nokia RapuYama"
+	depends on OF
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	depends on NOP_USB_XCEIV
+
 config USB_MUSB_MEDIATEK
 	tristate "MediaTek platforms"
 	depends on ARCH_MEDIATEK || COMPILE_TEST

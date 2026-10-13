@@ -24,6 +24,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/serial_core.h>
+#include <linux/string.h>
 
 #define RY_UART_ACTIVE		0x04
 #define RY_UART_DIV_A		0x08
@@ -74,6 +75,7 @@ static void rapuyama_uart_putc(struct uart_port *port, unsigned char c)
 {
 	int n = RY_UART_SPIN;
 
+	/* bounded: if TX_ROOM never clears we still return, never hang the boot */
 	while (!readl(port->membase + RY_UART_TX_ROOM) && --n)
 		cpu_relax();
 	writel(c, port->membase + RY_UART_TX);
@@ -96,18 +98,71 @@ static int __init rapuyama_early_setup(struct earlycon_device *dev,
 	if (!b)
 		return -ENODEV;
 
-	while (readl(b + RY_UART_BUSY) == 1 && --n)
-		cpu_relax();
-
-	writel(1, b + RY_UART_ACTIVE);
-	writel(RY_UART_TX_RX_ON, b + RY_UART_ENABLE);
-	writel(RY_UART_BITS_8, b + RY_UART_BITS);
-	writel(0, b + RY_UART_PARITY);
-	writel(0, b + RY_UART_PARITY_TYPE);
-	rapuyama_uart_set_baud(b, dev->baud ? dev->baud : 115200);
+	/*
+	 * symbian boots us with bluetooth on, so the uart is already clocked,
+	 * powered and running at some baud. by default only push bytes to the
+	 * tx fifo and touch nothing else: reconfiguring the block (baud, line)
+	 * is what the probes point at as the thing that faults (regprobe3 died
+	 * on a neighbouring reg even with the clock gate on). pass
+	 * "earlycon=rapuyama,0x20025a00,setup" to force the full init.
+	 */
+	if (opt && strstr(opt, "setup")) {
+		while (readl(b + RY_UART_BUSY) == 1 && --n)
+			cpu_relax();
+		writel(1, b + RY_UART_ACTIVE);
+		writel(RY_UART_TX_RX_ON, b + RY_UART_ENABLE);
+		writel(RY_UART_BITS_8, b + RY_UART_BITS);
+		writel(0, b + RY_UART_PARITY);
+		writel(0, b + RY_UART_PARITY_TYPE);
+		rapuyama_uart_set_baud(b, dev->baud ? dev->baud : 115200);
+	}
 
 	dev->con->write = rapuyama_early_write;
 	return 0;
 }
 EARLYCON_DECLARE(rapuyama, rapuyama_early_setup);
 OF_EARLYCON_DECLARE(rapuyama, "nokia,rapuyama-uart", rapuyama_early_setup);
+
+/*
+ * RAM early console (bring-up): writes every char into a ring buffer in plain
+ * RAM instead of any hardware. active from the very start of setup_arch, so it
+ * captures the whole early log that dies before pstore/ramoops even inits - and
+ * it touches no mmio, so unlike the uart earlycon it can't fault. the region
+ * survives the warm watchdog reset; read it back with driver/ramread.sis.
+ *
+ * layout at the mapped base: u32 magic 'E6LG', u32 len, then len bytes of log
+ * (wraps, len caps at the buffer size). earlycon=ramcon,0x1f000000
+ *
+ *   earlycon=ramcon,0x1f000000 keep_bootcon
+ */
+#define RY_RAMCON_MAGIC		0x474c3645u	/* 'E6LG' */
+#define RY_RAMCON_SIZE		0xf0000u	/* 960 KB of log */
+#define RY_RAMCON_HDR		8u
+
+static void rapuyama_ramcon_write(struct console *con, const char *s,
+				  unsigned int n)
+{
+	struct earlycon_device *dev = con->data;
+	void __iomem *base = dev->port.membase;
+	u32 len = readl(base + 4);
+
+	while (n--) {
+		writeb(*s++, base + RY_RAMCON_HDR + (len % RY_RAMCON_SIZE));
+		len++;
+	}
+	writel(len, base + 4);
+}
+
+static int __init rapuyama_ramcon_setup(struct earlycon_device *dev,
+					const char *opt)
+{
+	if (!dev->port.membase)
+		return -ENODEV;
+
+	/* always start fresh: one dump = one boot, no stale previous-boot log */
+	writel(RY_RAMCON_MAGIC, dev->port.membase);
+	writel(0, dev->port.membase + 4);
+	dev->con->write = rapuyama_ramcon_write;
+	return 0;
+}
+EARLYCON_DECLARE(ramcon, rapuyama_ramcon_setup);

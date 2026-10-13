@@ -16,6 +16,7 @@
 #include <linux/irq.h>
 #include <linux/irqchip.h>
 #include <linux/irqdomain.h>
+#include <linux/bitmap.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 
@@ -40,34 +41,36 @@
 /*
  * the gpio / peripheral secondary interrupt banks, in the clock-power block
  * (phys 0x20033400 + 0x40 * k). firmware FUN_800b8b18 masks all of them at
- * init (write ~0 to bank+0x14, drain bank+0x28 until -1), otherwise a source
+ * init (write ~0 to bank+0x14, drain bank+0x3c until -1), otherwise a source
  * symbian left enabled keeps asserting the main line -> irq storm the moment
  * interrupts are turned on (died exactly at local_irq_enable without this)
  */
 #define INTC_SEC_STRIDE		0x40
 #define INTC_SEC_DIS		0x14	/* write ~0 to disable every line in the bank */
-#define INTC_SEC_NUM		0x28	/* read until -1 to drain */
+#define INTC_SEC_NUM		0x3c	/* read until -1 to drain */
 #define INTC_SEC_BANKS		5
 #define INTC_DEF_PRIO		2	/* what Interrupt::Bind uses */
 #define INTC_NONE		(~0u)
 
-#ifdef CONFIG_ARCH_RAPUYAMA
-void rapuyama_checkpoint(int n);
-#else
-static inline void rapuyama_checkpoint(int n) { }
-#endif
-
 static void __iomem *intc_base;
 static void __iomem *intc_sec;	/* secondary (gpio/periph) banks, optional */
 static struct irq_domain *intc_domain;
+static DECLARE_BITMAP(intc_deferred_unmask, INTC_NR_IRQS);
+static bool intc_dispatching;
 
 static void rapuyama_intc_mask(struct irq_data *d)
 {
+	clear_bit(d->hwirq, intc_deferred_unmask);
 	writel_relaxed(d->hwirq, intc_base + INTC_IRQ_MASK);
 }
 
 static void rapuyama_intc_unmask(struct irq_data *d)
 {
+	if (intc_dispatching) {
+		set_bit(d->hwirq, intc_deferred_unmask);
+		return;
+	}
+
 	writel_relaxed(d->hwirq, intc_base + INTC_IRQ_UNMASK);
 }
 
@@ -109,29 +112,55 @@ static const struct irq_domain_ops rapuyama_intc_ops = {
 static void __exception_irq_entry rapuyama_intc_handle_irq(struct pt_regs *regs)
 {
 	int guard = 2 * INTC_NR_IRQS;
+	unsigned int line;
+	bool disable_all = false;
 	u32 hw;
 
-	/* cp20: first entry into the intc handler = an interrupt was delivered */
-	rapuyama_checkpoint(20);
-
+	intc_dispatching = true;
 	/*
-	 * read the pending line, dispatch, read the eoi (+0x80). bounded so a
-	 * line that keeps re-asserting (bad source ack, or a line with no linux
-	 * handler) can't lock the cpu forever: after too many iterations we
-	 * mask that line at the main bank and bail, which keeps the kernel
-	 * alive and makes a stuck source obvious instead of a silent hang.
+	 * Keep lines masked until the pending queue has been drained and EOI
+	 * written. The firmware's timer ISR follows this order; unmasking from
+	 * handle_level_irq() before EOI can immediately queue the same level IRQ.
 	 */
 	while ((hw = readl_relaxed(intc_base + INTC_IRQ_NUM)) != INTC_NONE) {
 		pr_info_once("rapuyama-intc: first irq hwirq=%u\n", hw);
-		if (hw >= INTC_NR_IRQS ||
-		    generic_handle_domain_irq(intc_domain, hw) || --guard <= 0) {
-			writel_relaxed(hw, intc_base + INTC_IRQ_MASK);
-			if (guard <= 0)
-				break;
+
+		if (unlikely(hw >= INTC_NR_IRQS)) {
+			pr_err_once("rapuyama-intc: invalid pending hwirq=%u, masking all IRQs\n",
+				    hw);
+			writel_relaxed(INTC_NONE, intc_base + INTC_IRQ_MASK);
+			bitmap_zero(intc_deferred_unmask, INTC_NR_IRQS);
+			disable_all = true;
+			break;
 		}
-		readl_relaxed(intc_base + INTC_IRQ_END);
+
+		/*
+		 * Count every valid dequeued IRQ, including unmapped lines.
+		 * Otherwise a controller repeatedly reporting an unhandled line
+		 * can keep this early boot path spinning forever.
+		 */
+		if (unlikely(--guard <= 0)) {
+			clear_bit(hw, intc_deferred_unmask);
+			writel_relaxed(hw, intc_base + INTC_IRQ_MASK);
+			pr_err_once("rapuyama-intc: pending IRQ queue did not drain\n");
+			break;
+		}
+
+		if (generic_handle_domain_irq(intc_domain, hw)) {
+			clear_bit(hw, intc_deferred_unmask);
+			writel_relaxed(hw, intc_base + INTC_IRQ_MASK);
+		}
 	}
-	readl_relaxed(intc_base + INTC_IRQ_END);
+	readl(intc_base + INTC_IRQ_END);
+
+	intc_dispatching = false;
+	if (disable_all)
+		return;
+
+	for_each_set_bit(line, intc_deferred_unmask, INTC_NR_IRQS) {
+		clear_bit(line, intc_deferred_unmask);
+		writel(line, intc_base + INTC_IRQ_UNMASK);
+	}
 }
 
 /* take whatever is still latched, bounded in case the block is dead */

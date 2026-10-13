@@ -20,6 +20,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irq.h>
+#include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
@@ -40,9 +41,12 @@
  */
 #define FC_LATCH_VAL	0xc6033354
 
+#define MST_BASE_HZ	1000
+
 static void __iomem *mst_base;
 static void __iomem *fc_base;
 static u32 mst_period;
+static u32 mst_tick_accumulator;
 
 static u64 notrace rapuyama_fc_read(void)
 {
@@ -65,6 +69,7 @@ static struct clocksource rapuyama_fc_cs = {
 
 static int rapuyama_mst_set_periodic(struct clock_event_device *evt)
 {
+	mst_tick_accumulator = 0;
 	writel_relaxed(mst_period, mst_base + MST_RELOAD);
 	writel_relaxed(mst_period, mst_base + MST_COUNT);
 	return 0;
@@ -103,9 +108,25 @@ static irqreturn_t rapuyama_mst_irq(int irq, void *dev_id)
 	/* checkpoint 11: a real timer interrupt arrived (e6.stop=11) */
 	rapuyama_checkpoint(11);
 
-	/* the firmware isr does this before NTimerQ::Tick, acts as the ack */
-	if (clockevent_state_periodic(evt))
-		writel_relaxed(mst_period, mst_base + MST_RELOAD);
+	/*
+	 * A pending hardware interrupt can outlive a clockevent state change.
+	 * Acknowledge and park it, but only deliver ticks while the core has
+	 * this device in periodic mode.
+	 */
+	if (!clockevent_state_periodic(evt)) {
+		writel_relaxed(~0u, mst_base + MST_RELOAD);
+		return IRQ_HANDLED;
+	}
+
+	/* The firmware ISR reloads before NTimerQ::Tick; this also acks the IRQ. */
+	writel_relaxed(mst_period, mst_base + MST_RELOAD);
+	mst_tick_accumulator += HZ;
+	if (mst_tick_accumulator < MST_BASE_HZ)
+		return IRQ_HANDLED;
+	mst_tick_accumulator -= MST_BASE_HZ;
+
+	if (WARN_ON_ONCE(!evt->event_handler))
+		return IRQ_HANDLED;
 	evt->event_handler(evt);
 	return IRQ_HANDLED;
 }
@@ -128,6 +149,12 @@ static int __init rapuyama_timer_init(struct device_node *np)
 	unsigned long mst_rate, fc_rate;
 	int irq, ret;
 
+	if (HZ > MST_BASE_HZ) {
+		pr_err("rapuyama-timer: HZ=%d exceeds the 1 ms timer resolution\n",
+		       HZ);
+		return -EINVAL;
+	}
+
 	mst_base = of_iomap(np, 0);
 	fc_base = of_iomap(np, 1);
 	if (!mst_base || !fc_base) {
@@ -149,7 +176,11 @@ static int __init rapuyama_timer_init(struct device_node *np)
 	if (ret)
 		return ret;
 
-	mst_period = DIV_ROUND_CLOSEST(mst_rate, HZ);
+	/*
+	 * The only period confirmed on hardware is 1 ms (0x9600 at 38.4 MHz).
+	 * Keep the down-counter in that range and divide interrupts to Linux HZ.
+	 */
+	mst_period = DIV_ROUND_CLOSEST(mst_rate, MST_BASE_HZ);
 	ret = request_irq(irq, rapuyama_mst_irq, IRQF_TIMER | IRQF_IRQPOLL,
 			  "rapuyama-mst", &rapuyama_mst_ced);
 	if (ret)
@@ -159,8 +190,8 @@ static int __init rapuyama_timer_init(struct device_node *np)
 	rapuyama_mst_ced.cpumask = cpu_possible_mask;
 	clockevents_register_device(&rapuyama_mst_ced);
 
-	pr_info("rapuyama-timer: ms timer %lu Hz (irq %d), counter %lu Hz\n",
-		mst_rate, irq, fc_rate);
+	pr_info("rapuyama-timer: ms timer %lu Hz, %u Hz base / %u Hz Linux tick (irq %d), counter %lu Hz\n",
+		mst_rate, MST_BASE_HZ, HZ, irq, fc_rate);
 	return 0;
 }
 TIMER_OF_DECLARE(rapuyama, "nokia,rapuyama-timer", rapuyama_timer_init);

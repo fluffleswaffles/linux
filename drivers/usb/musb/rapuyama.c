@@ -68,6 +68,30 @@ static int rapuyama_musb_wrapper_init(struct musb *musb)
 	return 0;
 }
 
+/*
+ * plain musb core interrupt, nothing in the wrapper needs acking (same as
+ * omap2430, which this block is a copy of). musb_core refuses to probe with
+ * -ENODEV when the glue doesn't set musb->isr
+ */
+static irqreturn_t rapuyama_musb_interrupt(int irq, void *__hci)
+{
+	struct musb *musb = __hci;
+	irqreturn_t ret = IRQ_NONE;
+	unsigned long flags;
+
+	spin_lock_irqsave(&musb->lock, flags);
+
+	musb->int_usb = musb_readb(musb->mregs, MUSB_INTRUSB);
+	musb->int_tx = musb_readw(musb->mregs, MUSB_INTRTX);
+	musb->int_rx = musb_readw(musb->mregs, MUSB_INTRRX);
+
+	if (musb->int_usb || musb->int_tx || musb->int_rx)
+		ret = musb_interrupt(musb);
+
+	spin_unlock_irqrestore(&musb->lock, flags);
+	return ret;
+}
+
 static int rapuyama_musb_init(struct musb *musb)
 {
 	struct device *dev = musb->controller;
@@ -84,8 +108,13 @@ static int rapuyama_musb_init(struct musb *musb)
 		return ret;
 	}
 
-	dev_info(dev, "otg wrapper rev %#x\n",
-		 readl(musb->mregs + RY_OTG_REVISION));
+	musb->isr = rapuyama_musb_interrupt;
+
+	/* bring-up: what the core looks like, devctl bit 3..4 = vbus level */
+	dev_info(dev, "otg wrapper rev %#x, devctl %#x, power %#x\n",
+		 readl(musb->mregs + RY_OTG_REVISION),
+		 musb_readb(musb->mregs, MUSB_DEVCTL),
+		 musb_readb(musb->mregs, MUSB_POWER));
 	return 0;
 }
 

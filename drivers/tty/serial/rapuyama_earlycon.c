@@ -139,15 +139,40 @@ OF_EARLYCON_DECLARE(rapuyama, "nokia,rapuyama-uart", rapuyama_early_setup);
 #define RY_RAMCON_SIZE		0xf0000u	/* 960 KB of log */
 #define RY_RAMCON_HDR		8u
 
+/*
+ * the generic earlycon code maps just ONE page of the buffer (earlycon_map ->
+ * a single fixmap slot), so everything past the first 4 KB of log used to
+ * fault in here and take init down with console_sem held: the "hang" right
+ * after ~4 KB of log. mach-rapuyama maps the whole 1 MB statically in map_io
+ * and hands it over with rapuyama_ramcon_set_full(); until then (only the
+ * first few hundred bytes of the log) writes stay inside the first page
+ */
+static struct earlycon_device *rapuyama_ramcon_dev;
+static void __iomem *rapuyama_ramcon_full;
+
+void rapuyama_ramcon_set_full(phys_addr_t phys, void __iomem *virt);
+
+void rapuyama_ramcon_set_full(phys_addr_t phys, void __iomem *virt)
+{
+	if (rapuyama_ramcon_dev && rapuyama_ramcon_dev->port.mapbase == phys)
+		WRITE_ONCE(rapuyama_ramcon_full, virt);
+}
+
 static void rapuyama_ramcon_write(struct console *con, const char *s,
 				  unsigned int n)
 {
 	struct earlycon_device *dev = con->data;
-	void __iomem *base = dev->port.membase;
+	void __iomem *full = READ_ONCE(rapuyama_ramcon_full);
+	void __iomem *base = full ? full : dev->port.membase;
+	u32 size = full ? RY_RAMCON_SIZE :
+		   PAGE_SIZE - offset_in_page(dev->port.mapbase) - RY_RAMCON_HDR;
 	u32 len = readl(base + 4);
 
 	while (n--) {
-		writeb(*s++, base + RY_RAMCON_HDR + (len % RY_RAMCON_SIZE));
+		/* only one page mapped yet: drop what doesn't fit, don't fault */
+		if (!full && len >= size)
+			break;
+		writeb(*s++, base + RY_RAMCON_HDR + (len % size));
 		len++;
 	}
 	writel(len, base + 4);
@@ -162,6 +187,7 @@ static int __init rapuyama_ramcon_setup(struct earlycon_device *dev,
 	/* always start fresh: one dump = one boot, no stale previous-boot log */
 	writel(RY_RAMCON_MAGIC, dev->port.membase);
 	writel(0, dev->port.membase + 4);
+	rapuyama_ramcon_dev = dev;
 	dev->con->write = rapuyama_ramcon_write;
 	return 0;
 }

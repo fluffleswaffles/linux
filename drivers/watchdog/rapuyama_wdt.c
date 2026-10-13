@@ -67,6 +67,12 @@ struct rapuyama_wdt {
 	spinlock_t lock;
 };
 
+#ifdef CONFIG_ARCH_RAPUYAMA
+void rapuyama_early_wdt_stop(void);	/* arch/arm/mach-rapuyama */
+#else
+static inline void rapuyama_early_wdt_stop(void) { }
+#endif
+
 /* rebootdriver.ldd 0x800cd0bc: irqs off, write 2, spin */
 #define SOC_RESET_VAL	2
 
@@ -197,6 +203,9 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	ret = devm_watchdog_register_device(dev, &rw->wdd);
 	if (ret)
 		return ret;
+
+	/* the watchdog core feeds it from here on, stop the timer irq kick */
+	rapuyama_early_wdt_stop();
 
 	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
 					    SYS_OFF_PRIO_DEFAULT,

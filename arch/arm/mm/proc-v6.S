@@ -257,7 +257,7 @@ __v6_setup:
 	 */
 	.type	v6_crval, #object
 v6_crval:
-	crval	clear=0x01e0fb7f, mmuset=0x00c0387d, ucset=0x00c0187c
+	crval	clear=0x31e0fb7f, mmuset=0x00c0387d, ucset=0x00c0187c
 
 	__INITDATA
 

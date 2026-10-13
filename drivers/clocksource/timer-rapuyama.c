@@ -97,9 +97,13 @@ static struct clock_event_device rapuyama_mst_ced = {
 
 #ifdef CONFIG_ARCH_RAPUYAMA
 void rapuyama_checkpoint(int n);
+void rapuyama_early_wdt_kick(void);
 #else
 static inline void rapuyama_checkpoint(int n) { }
+static inline void rapuyama_early_wdt_kick(void) { }
 #endif
+
+static u32 mst_wdt_ticks;
 
 static irqreturn_t rapuyama_mst_irq(int irq, void *dev_id)
 {
@@ -107,6 +111,12 @@ static irqreturn_t rapuyama_mst_irq(int irq, void *dev_id)
 
 	/* checkpoint 11: a real timer interrupt arrived (e6.stop=11) */
 	rapuyama_checkpoint(11);
+
+	/* feed the soc watchdog every ~100 ms until the wdt driver is up */
+	if (++mst_wdt_ticks >= 100) {
+		mst_wdt_ticks = 0;
+		rapuyama_early_wdt_kick();
+	}
 
 	/*
 	 * A pending hardware interrupt can outlive a clockevent state change.
@@ -170,6 +180,8 @@ static int __init rapuyama_timer_init(struct device_node *np)
 
 	mst_rate = rapuyama_rate(np, "ref", MST_DEF_RATE);
 	fc_rate = rapuyama_rate(np, "fc", FC_DEF_RATE);
+
+	rapuyama_early_wdt_kick();
 
 	sched_clock_register(rapuyama_fc_read, 32, fc_rate);
 	ret = clocksource_register_hz(&rapuyama_fc_cs, fc_rate);

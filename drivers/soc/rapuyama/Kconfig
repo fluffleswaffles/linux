@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config SOC_RAPUYAMA_VIDEOCORE
-	tristate "Nokia RapuYama VideoCore transport scaffold"
-	depends on ARCH_RAPUYAMA && OF
+	tristate "Nokia RapuYama BCM2727 VideoCore display"
+	depends on ARCH_RAPUYAMA && OF && FB
+	depends on GPIOLIB && COMMON_CLK
+	select FW_LOADER
+	select FB_SYSMEM_HELPERS_DEFERRED
 	help
-	  Build the platform-driver scaffold for the Nokia RapuYama BCM2727
-	  VideoCore transport. The bootstrap and MeSSI/VCHI protocol are not
-	  implemented yet; the driver does not access hardware registers.
+	  Boots the BCM2727 VideoCore of the Nokia E6 over the ViSSI host bus
+	  (firmware vc/vc-loader-a and vc/vc-main, extracted from the Symbian
+	  ROM with vc_extract.py), brings the LCD panel up and exposes a
+	  640x480 framebuffer that is pushed to the VideoCore on every change.
 
-	  This option is not enabled by default. If unsure, say N.
+	  If unsure, say N.

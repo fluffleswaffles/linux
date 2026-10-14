@@ -52,7 +52,21 @@
 #define INTC_DEF_PRIO		2	/* what Interrupt::Bind uses */
 #define INTC_NONE		(~0u)
 
+#ifdef CONFIG_ARCH_RAPUYAMA
+__printf(1, 2) void rapuyama_note(const char *fmt, ...);	/* mach-rapuyama */
+#else
+static inline __printf(1, 2) void rapuyama_note(const char *fmt, ...) { }
+#endif
+
+/*
+ * an out of range number from INTC_IRQ_NUM is treated as spurious (EOI and
+ * leave) unless it keeps coming: masking every line on the first one also
+ * stops the timer, the soc watchdog then resets the phone silently
+ */
+#define INTC_BAD_LIMIT		1000
+
 static void __iomem *intc_base;
+static unsigned int intc_bad_in_row;
 static void __iomem *intc_sec;	/* secondary (gpio/periph) banks, optional */
 static struct irq_domain *intc_domain;
 static DECLARE_BITMAP(intc_deferred_unmask, INTC_NR_IRQS);
@@ -126,6 +140,13 @@ static void __exception_irq_entry rapuyama_intc_handle_irq(struct pt_regs *regs)
 		pr_info_once("rapuyama-intc: first irq hwirq=%u\n", hw);
 
 		if (unlikely(hw >= INTC_NR_IRQS)) {
+			if (intc_bad_in_row < 16)
+				rapuyama_note("e6: intc invalid pending hwirq %#x (%u in a row)\n",
+					      hw, intc_bad_in_row + 1);
+			if (++intc_bad_in_row < INTC_BAD_LIMIT)
+				break;
+			rapuyama_note("e6: intc keeps reporting hwirq %#x, masking all IRQs\n",
+				      hw);
 			pr_err_once("rapuyama-intc: invalid pending hwirq=%u, masking all IRQs\n",
 				    hw);
 			writel_relaxed(INTC_NONE, intc_base + INTC_IRQ_MASK);
@@ -133,6 +154,7 @@ static void __exception_irq_entry rapuyama_intc_handle_irq(struct pt_regs *regs)
 			disable_all = true;
 			break;
 		}
+		intc_bad_in_row = 0;
 
 		/*
 		 * Count every valid dequeued IRQ, including unmapped lines.
@@ -142,6 +164,8 @@ static void __exception_irq_entry rapuyama_intc_handle_irq(struct pt_regs *regs)
 		if (unlikely(--guard <= 0)) {
 			clear_bit(hw, intc_deferred_unmask);
 			writel_relaxed(hw, intc_base + INTC_IRQ_MASK);
+			rapuyama_note("e6: intc queue did not drain, masked hwirq %u\n",
+				      hw);
 			pr_err_once("rapuyama-intc: pending IRQ queue did not drain\n");
 			break;
 		}
@@ -149,6 +173,7 @@ static void __exception_irq_entry rapuyama_intc_handle_irq(struct pt_regs *regs)
 		if (generic_handle_domain_irq(intc_domain, hw)) {
 			clear_bit(hw, intc_deferred_unmask);
 			writel_relaxed(hw, intc_base + INTC_IRQ_MASK);
+			rapuyama_note("e6: intc unmapped hwirq %u, masked\n", hw);
 		}
 	}
 	readl(intc_base + INTC_IRQ_END);

@@ -13,12 +13,19 @@
 
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/kernel_stat.h>
 #include <linux/irqflags.h>
 #include <linux/console.h>
 #include <linux/kmsg_dump.h>
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
+#include <linux/export.h>
+#include <linux/signal.h>
+#include <asm/bug.h>
 #include <asm/irq_regs.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
@@ -64,6 +71,59 @@ static struct map_desc rapuyama_io_desc[] __initdata = {
 
 static int rapuyama_stop;
 static bool rapuyama_mapped;
+
+/*
+ * reading a SoC block that is unpowered or unclocked ends in a precise
+ * external abort (fsr 0x1008). that happens with the usb block when the phone
+ * was booted without a cable: symbian had the modem power the usb side down,
+ * and only the modem can bring it back. rapuyama_safe_readl() guards one load
+ * so a driver can find out the block is dead instead of oopsing on it.
+ */
+static unsigned long rapuyama_safe_pc;	/* the guarded ldr, 0 = none armed */
+static bool rapuyama_safe_faulted;
+
+static int rapuyama_ext_abort(unsigned long addr, unsigned int fsr,
+			      struct pt_regs *regs)
+{
+	if (!rapuyama_safe_pc || instruction_pointer(regs) != rapuyama_safe_pc)
+		return 1;	/* not ours: the usual "unhandled fault" oops */
+	rapuyama_safe_faulted = true;
+	regs->ARM_pc += 4;	/* skip the ldr, the result stays ~0 */
+	return 0;
+}
+
+int rapuyama_safe_readl(const void __iomem *addr, u32 *val);
+
+/* 0 and the value, or -EIO if the read aborted (block powered down) */
+int rapuyama_safe_readl(const void __iomem *addr, u32 *val)
+{
+	unsigned long flags, pc;
+	u32 v = ~0u;
+	bool faulted;
+
+	local_irq_save(flags);
+	rapuyama_safe_faulted = false;
+	asm volatile(
+		"	adr	%1, 1f\n"
+		"	str	%1, [%3]\n"
+		"1:	ldr	%0, [%2]\n"
+		: "+r" (v), "=&r" (pc)
+		: "r" (addr), "r" (&rapuyama_safe_pc)
+		: "memory");
+	WRITE_ONCE(rapuyama_safe_pc, 0);
+	faulted = READ_ONCE(rapuyama_safe_faulted);
+	local_irq_restore(flags);
+
+	*val = v;
+	return faulted ? -EIO : 0;
+}
+EXPORT_SYMBOL_GPL(rapuyama_safe_readl);
+
+static void __init rapuyama_init_early(void)
+{
+	hook_fault_code(8, rapuyama_ext_abort, SIGBUS, 0,
+			"external abort on non-linefetch");
+}
 
 static int __init rapuyama_stop_param(char *s)
 {
@@ -142,8 +202,30 @@ static int __init rapuyama_wdtfeed_param(char *s)
 }
 early_param("e6.wdtfeed", rapuyama_wdtfeed_param);
 
+/*
+ * stall detector, once the watchdog driver runs: the watchdog core pings
+ * every 1.5 s from a SCHED_FIFO kthread. if the ms timer irq still runs but
+ * no ping came for e6.stall seconds (default 5, 0 = off), the kernel is
+ * stuck with irqs alive (irq storm, a task spinning, a deadlock): dump it
+ * the same way as the early case. the soc watchdog resets ~13 s after the
+ * last ping, so the dump is in ramcon before the warm reset.
+ */
+static unsigned int rapuyama_stall_s = 5;
+static unsigned int rapuyama_alive_ticks;
+static unsigned long rapuyama_last_ping;
+static bool rapuyama_pinged;
+static bool rapuyama_stall_dumped;
+
+static int __init rapuyama_stall_param(char *s)
+{
+	return kstrtouint(s, 0, &rapuyama_stall_s);
+}
+early_param("e6.stall", rapuyama_stall_param);
+
 void rapuyama_early_wdt_kick(void);
 void rapuyama_early_wdt_stop(void);
+void rapuyama_wdt_pinged(void);
+__printf(1, 2) void rapuyama_note(const char *fmt, ...);
 
 /* append straight to the ramcon ring, same format as the earlycon */
 static void rapuyama_raw_write(const char *s, size_t n)
@@ -174,6 +256,45 @@ static __printf(1, 2) void rapuyama_raw_printf(const char *fmt, ...)
 }
 
 /*
+ * for drivers (irqchip, watchdog): a line straight into ramcon, no printk,
+ * usable from any context, including with every irq masked
+ */
+void rapuyama_note(const char *fmt, ...)
+{
+	static char buf[256];
+	unsigned long flags;
+	va_list args;
+	int n;
+
+	if (!rapuyama_mapped)
+		return;
+	local_irq_save(flags);
+	va_start(args, fmt);
+	n = vscnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	rapuyama_raw_write(buf, n);
+	local_irq_restore(flags);
+}
+
+/* every irq that fired so far: a storm shows up as one huge count */
+static void rapuyama_raw_irq_counts(void)
+{
+	struct irq_desc *desc;
+	unsigned int i, n;
+
+	rapuyama_raw_printf("e6: irq counts (irq hwirq count name):\n");
+	for_each_irq_desc(i, desc) {
+		n = kstat_irqs_cpu(i, 0);
+		if (!n)
+			continue;
+		rapuyama_raw_printf("e6:   %u %lu %u %s\n", i,
+				    desc->irq_data.hwirq, n,
+				    desc->action && desc->action->name ?
+				    desc->action->name : "-");
+	}
+}
+
+/*
  * the console may be what is stuck (console_sem held forever, nothing gets
  * printed while the kernel runs on), so after the dump copy the whole printk
  * ring buffer into ramcon by hand. it's lockless, readable from any context
@@ -191,26 +312,14 @@ static void rapuyama_raw_replay_log(void)
 	rapuyama_raw_printf("===== e6: end of replay =====\n");
 }
 
-/* called from the ms timer irq every ~100 ms */
-void rapuyama_early_wdt_kick(void)
+/* dump what the cpu and every task are doing, then replay printk to ramcon */
+static void rapuyama_dump_stuck(const char *why)
 {
-	struct pt_regs *regs;
-
-	if (!rapuyama_mapped || READ_ONCE(rapuyama_early_wdt_done))
-		return;
-
-	writel_relaxed(RY_SOC_WDT_VAL, RY_BUS(RY_SOC_WDT));
-
-	if (!rapuyama_wdt_feed_s ||
-	    ++rapuyama_wdt_kicks < rapuyama_wdt_feed_s * 10)
-		return;
-
-	WRITE_ONCE(rapuyama_early_wdt_done, true);
-	regs = get_irq_regs();
+	struct pt_regs *regs = get_irq_regs();
 
 	/* the short version first, written raw so it lands no matter what */
-	rapuyama_raw_printf("\n===== e6: no watchdog driver after %u s =====\n",
-			    rapuyama_wdt_feed_s);
+	rapuyama_raw_printf("\n===== e6: %s, uptime %u ms =====\n", why,
+			    jiffies_to_msecs(jiffies - INITIAL_JIFFIES));
 	rapuyama_raw_printf("e6: current %s pid %d, in_task %d\n",
 			    current->comm, task_pid_nr(current), (int)!!in_task());
 	if (regs)
@@ -224,22 +333,86 @@ void rapuyama_early_wdt_kick(void)
 		rapuyama_raw_printf("e6: console_sem is HELD by someone\n");
 	}
 
+	rapuyama_raw_irq_counts();
+
 	/* the long version into the printk buffer, then copied out by hand */
-	pr_emerg("rapuyama: no watchdog driver after %u s, kernel looks stuck. interrupted at:\n",
-		 rapuyama_wdt_feed_s);
+	pr_emerg("rapuyama: %s, kernel looks stuck. interrupted at:\n", why);
 	if (regs)
 		show_regs(regs);
 	pr_emerg("rapuyama: all tasks:\n");
 	show_state();
-	pr_emerg("rapuyama: stopped feeding the soc watchdog, warm reset in ~13 s\n");
+	pr_emerg("rapuyama: the soc watchdog is not fed any more, warm reset soon\n");
 
 	rapuyama_raw_replay_log();
+}
+
+/* the watchdog driver pinged (watchdog core thread or userspace) */
+void rapuyama_wdt_pinged(void)
+{
+	WRITE_ONCE(rapuyama_last_ping, jiffies);
+	WRITE_ONCE(rapuyama_pinged, true);
+}
+
+static void rapuyama_stall_check(void)
+{
+	char why[64];
+
+	if (!rapuyama_stall_s || rapuyama_stall_dumped ||
+	    !READ_ONCE(rapuyama_pinged))
+		return;
+	if (!time_after(jiffies, READ_ONCE(rapuyama_last_ping) +
+				 rapuyama_stall_s * HZ))
+		return;
+	rapuyama_stall_dumped = true;
+	snprintf(why, sizeof(why), "watchdog not pinged for %u ms",
+		 jiffies_to_msecs(jiffies - READ_ONCE(rapuyama_last_ping)));
+	rapuyama_dump_stuck(why);
+}
+
+/*
+ * heartbeat straight into ramcon (not the console): after a reset the dump
+ * shows how long linux lived. replaces the old init.sh one, which spammed
+ * the console every 10 s
+ */
+static void rapuyama_alive(void)
+{
+	if (++rapuyama_alive_ticks < 100)
+		return;
+	rapuyama_alive_ticks = 0;
+	rapuyama_raw_printf("e6: alive, uptime %u s\n",
+			    jiffies_to_msecs(jiffies - INITIAL_JIFFIES) / 1000);
+}
+
+/* called from the ms timer irq every ~100 ms */
+void rapuyama_early_wdt_kick(void)
+{
+	char why[48];
+
+	if (!rapuyama_mapped)
+		return;
+	rapuyama_alive();
+	if (READ_ONCE(rapuyama_early_wdt_done)) {
+		rapuyama_stall_check();
+		return;
+	}
+
+	writel_relaxed(RY_SOC_WDT_VAL, RY_BUS(RY_SOC_WDT));
+
+	if (!rapuyama_wdt_feed_s ||
+	    ++rapuyama_wdt_kicks < rapuyama_wdt_feed_s * 10)
+		return;
+
+	WRITE_ONCE(rapuyama_early_wdt_done, true);
+	snprintf(why, sizeof(why), "no watchdog driver after %u s",
+		 rapuyama_wdt_feed_s);
+	rapuyama_dump_stuck(why);
 }
 
 void rapuyama_early_wdt_stop(void)
 {
 	WRITE_ONCE(rapuyama_early_wdt_done, true);
-	pr_info("rapuyama: early soc watchdog feeding stopped, driver took over\n");
+	pr_info("rapuyama: early soc watchdog feeding stopped, driver took over (stall detector %u s, ramcon heartbeat 10 s)\n",
+		rapuyama_stall_s);
 }
 
 static const char *const rapuyama_dt_compat[] __initconst = {
@@ -250,4 +423,5 @@ static const char *const rapuyama_dt_compat[] __initconst = {
 DT_MACHINE_START(RAPUYAMA, "Nokia RapuYama")
 	.dt_compat	= rapuyama_dt_compat,
 	.map_io		= rapuyama_map_io,
+	.init_early	= rapuyama_init_early,
 MACHINE_END

@@ -69,8 +69,10 @@ struct rapuyama_wdt {
 
 #ifdef CONFIG_ARCH_RAPUYAMA
 void rapuyama_early_wdt_stop(void);	/* arch/arm/mach-rapuyama */
+void rapuyama_wdt_pinged(void);		/* stall detector there */
 #else
 static inline void rapuyama_early_wdt_stop(void) { }
+static inline void rapuyama_wdt_pinged(void) { }
 #endif
 
 /* rebootdriver.ldd 0x800cd0bc: irqs off, write 2, spin */
@@ -110,11 +112,16 @@ static int rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 static int rapuyama_wdt_ping(struct watchdog_device *wdd)
 {
 	struct rapuyama_wdt *rw = watchdog_get_drvdata(wdd);
+	int ret;
 
 	if (!wdd->timeout)
 		return -EINVAL; /* 0 would power the phone off */
 	writel(SOC_WDT_RELOAD, rw->soc);
-	return rapuyama_cbus_write(rw, PMIC_DEV, PMIC_REG_WDT, wdd->timeout);
+	rapuyama_wdt_pinged();
+	ret = rapuyama_cbus_write(rw, PMIC_DEV, PMIC_REG_WDT, wdd->timeout);
+	if (ret)
+		dev_warn_ratelimited(wdd->parent, "pmic kick failed: %d\n", ret);
+	return ret;
 }
 
 static int rapuyama_wdt_set_timeout(struct watchdog_device *wdd,

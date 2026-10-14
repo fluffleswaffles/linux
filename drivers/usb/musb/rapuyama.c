@@ -39,6 +39,16 @@
 #define RY_OTG_FORCESTDBY	0x414
 #define RY_FORCESTDBY_ENABLE	BIT(0)
 
+#ifdef CONFIG_ARCH_RAPUYAMA
+int rapuyama_safe_readl(const void __iomem *addr, u32 *val);	/* mach-rapuyama */
+#else
+static inline int rapuyama_safe_readl(const void __iomem *addr, u32 *val)
+{
+	*val = readl(addr);
+	return 0;
+}
+#endif
+
 struct rapuyama_glue {
 	struct platform_device	*musb;
 };
@@ -47,10 +57,24 @@ static int rapuyama_musb_wrapper_init(struct musb *musb)
 {
 	void __iomem *b = musb->mregs;
 	int n = 10;
+	u32 v;
+
+	/*
+	 * without a usb cable at the handoff symbian has the modem power the
+	 * usb side down (usb.dll asks it over ISI), and every access to the
+	 * block ends in an external abort. find out with guarded reads and
+	 * give up cleanly instead of taking init down with an oops
+	 */
+	if (rapuyama_safe_readl(b + RY_OTG_REVISION, &v))
+		return -ENODEV;
 
 	/* usb.dll 0x80189550: reset, then poll reset done 10 x 5 ms */
 	writel(RY_SYSCONFIG_SOFTRST, b + RY_OTG_SYSCONFIG);
-	while (!(readl(b + RY_OTG_SYSSTATUS) & RY_SYSSTATUS_RESETDONE)) {
+	for (;;) {
+		if (rapuyama_safe_readl(b + RY_OTG_SYSSTATUS, &v))
+			return -ENODEV;
+		if (v & RY_SYSSTATUS_RESETDONE)
+			break;
 		if (!--n)
 			return -ETIMEDOUT;
 		usleep_range(5000, 6000);
@@ -103,6 +127,10 @@ static int rapuyama_musb_init(struct musb *musb)
 				     "no transceiver\n");
 
 	ret = rapuyama_musb_wrapper_init(musb);
+	if (ret == -ENODEV) {
+		dev_warn(dev, "usb block is powered down (no cable at boot?), no usb\n");
+		return ret;
+	}
 	if (ret) {
 		dev_err(dev, "wrapper reset timed out\n");
 		return ret;

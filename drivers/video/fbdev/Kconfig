@@ -1773,6 +1773,18 @@ config FB_HYPERV
 	help
 	  This framebuffer driver supports Microsoft Hyper-V Synthetic Video.
 
+config FB_RAPUYAMA
+	bool "RapuYama reserved framebuffer memory interface"
+	depends on FB && ARCH_RAPUYAMA && OF
+	select FB_CFB_FILLRECT
+	select FB_CFB_COPYAREA
+	select FB_CFB_IMAGEBLIT
+	select FB_IOMEM_FOPS
+	help
+	  Expose a reserved RapuYama display buffer through fbdev. This driver
+	  only maps framebuffer memory; it does not communicate with VideoCore
+	  and does not refresh the command-mode panel.
+
 config FB_SIMPLE
 	tristate "Simple framebuffer support"
 	depends on FB

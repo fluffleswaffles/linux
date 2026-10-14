@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config SOC_RAPUYAMA_VIDEOCORE
+	tristate "Nokia RapuYama VideoCore transport scaffold"
+	depends on ARCH_RAPUYAMA && OF
+	help
+	  Build the platform-driver scaffold for the Nokia RapuYama BCM2727
+	  VideoCore transport. The bootstrap and MeSSI/VCHI protocol are not
+	  implemented yet; the driver does not access hardware registers.
+
+	  This option is not enabled by default. If unsure, say N.

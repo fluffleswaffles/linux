@@ -25,7 +25,11 @@
 #include <linux/sched/debug.h>
 #include <linux/export.h>
 #include <linux/signal.h>
+#include <linux/of.h>
+#include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <asm/bug.h>
+#include <asm/cacheflush.h>
 #include <asm/irq_regs.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
@@ -383,6 +387,66 @@ static void rapuyama_alive(void)
 			    jiffies_to_msecs(jiffies - INITIAL_JIFFIES) / 1000);
 }
 
+/*
+ * flight recorder: the phone dies by an outside reset (2-3 s after usb and
+ * the screen stop, back into symbian) with nothing in the log. every 100 ms
+ * snapshot the always-on regs (clock gates, power domains, secondary irq
+ * banks, gpio levels, soc watchdog...) into a ring at the end of the ramcon
+ * buffer, so after the reset tools/parse_flight.py shows what moved in the
+ * last ~25 s, and how long the cpu kept going after the usb died.
+ * layout at ramcon +0xf8000: u32 'E6FR', u32 samples written, u32 nregs,
+ * u32 nslots, u32 reg offsets[nregs] (from phys 0x20000000), then from +0x100
+ * the slots: u32 seq, u32 uptime ms, u32 regs[nregs]
+ */
+#define RY_FR_OFF	0xf8000u
+#define RY_FR_MAGIC	0x52463645u	/* 'E6FR' */
+#define RY_FR_DATA	0x100u
+
+static const u32 rapuyama_fr_regs[] = {
+	0x33350, /* 32k fast counter */
+	0x336c4, /* soc watchdog counter */
+	0x40280, /* sisa self irq lines 30/31 */
+	0x40400, /* boot mode nibble */
+	0x33194, /* trace/crashlog debug reg */
+	/* clock gates / power domains (clk-rapuyama, power_resources) */
+	0x33008, 0x33010, 0x33038, 0x33058, 0x33080, 0x330b0, 0x330d0,
+	0x33130, 0x33150, 0x33178, 0x33180,
+	/* secondary irq banks: raw state, enabled mask */
+	0x33408, 0x33418, 0x33448, 0x33458, 0x33488, 0x33498,
+	0x334c8, 0x334d8, 0x33508, 0x33518,
+	/* gpio levels, banks 0-4 */
+	0x319f0, 0x31a00, 0x31a10, 0x31a20, 0x31a30,
+};
+
+#define RY_FR_NREGS	ARRAY_SIZE(rapuyama_fr_regs)
+#define RY_FR_SLOT	((2 + RY_FR_NREGS) * 4)
+#define RY_FR_NSLOTS	((0x100000u - RY_FR_OFF - RY_FR_DATA) / RY_FR_SLOT)
+
+static u32 rapuyama_fr_seq;
+
+static void rapuyama_flight_record(void)
+{
+	void __iomem *fr = (void __iomem *)RY_RAMCON_VIRT + RY_FR_OFF;
+	void __iomem *slot;
+	unsigned int i;
+
+	if (!rapuyama_fr_seq) {
+		writel(0, fr + 4);
+		writel(RY_FR_NREGS, fr + 8);
+		writel(RY_FR_NSLOTS, fr + 12);
+		for (i = 0; i < RY_FR_NREGS; i++)
+			writel(rapuyama_fr_regs[i], fr + 16 + i * 4);
+		writel(RY_FR_MAGIC, fr);
+	}
+	slot = fr + RY_FR_DATA + (rapuyama_fr_seq % RY_FR_NSLOTS) * RY_FR_SLOT;
+	writel(rapuyama_fr_seq, slot);
+	writel(jiffies_to_msecs(jiffies - INITIAL_JIFFIES), slot + 4);
+	for (i = 0; i < RY_FR_NREGS; i++)
+		writel(readl_relaxed(RY_BUS(rapuyama_fr_regs[i])),
+		       slot + 8 + i * 4);
+	writel(++rapuyama_fr_seq, fr + 4);
+}
+
 /* called from the ms timer irq every ~100 ms */
 void rapuyama_early_wdt_kick(void)
 {
@@ -391,12 +455,18 @@ void rapuyama_early_wdt_kick(void)
 	if (!rapuyama_mapped)
 		return;
 	rapuyama_alive();
+	rapuyama_flight_record();
+
+	/* ALWAYS feed the SoC watchdog from hardirq context - this is a
+	 * hardware backup that can't be blocked by thread scheduling.
+	 * The watchdog driver also feeds it, but redundant writes are safe.
+	 */
+	writel_relaxed(RY_SOC_WDT_VAL, RY_BUS(RY_SOC_WDT));
+
 	if (READ_ONCE(rapuyama_early_wdt_done)) {
 		rapuyama_stall_check();
 		return;
 	}
-
-	writel_relaxed(RY_SOC_WDT_VAL, RY_BUS(RY_SOC_WDT));
 
 	if (!rapuyama_wdt_feed_s ||
 	    ++rapuyama_wdt_kicks < rapuyama_wdt_feed_s * 10)
@@ -414,6 +484,117 @@ void rapuyama_early_wdt_stop(void)
 	pr_info("rapuyama: early soc watchdog feeding stopped, driver took over (stall detector %u s, ramcon heartbeat 10 s)\n",
 		rapuyama_stall_s);
 }
+
+/*
+ * shared ram watch. symbian maps these ram ranges in its 0xc6 hw window, so
+ * something other than the arm (modem / secure side) uses them. the dt
+ * reserves them (still mapped, see e6.dts). every 2 s each 4 KB page gets a checksum, a page that
+ * changed since the last pass goes to the log with its first words. nothing
+ * here = nobody writes there and the random deaths are something else.
+ * e6.shmwatch=0 turns it off
+ */
+static const struct {
+	phys_addr_t base;
+	size_t size;
+} rapuyama_shm[] = {
+	{ 0x11525000, 0x2000 },
+	{ 0x1f8b0000, 0x44d000 },
+	{ 0x1ffe0000, 0x20000 },
+};
+
+#define RY_SHM_PERIOD (2 * HZ)
+#define RY_SHM_MAXLOG 8	/* changed pages logged per pass */
+
+static bool rapuyama_shm_on = true;
+static u32 *rapuyama_shm_virt[ARRAY_SIZE(rapuyama_shm)];
+static u32 *rapuyama_shm_sum[ARRAY_SIZE(rapuyama_shm)];
+static unsigned int rapuyama_shm_pass;
+static struct delayed_work rapuyama_shm_work;
+
+static int __init rapuyama_shmwatch_param(char *s)
+{
+	return kstrtobool(s, &rapuyama_shm_on);
+}
+early_param("e6.shmwatch", rapuyama_shmwatch_param);
+
+static u32 rapuyama_shm_page_sum(const u32 *p)
+{
+	u32 sum = 0;
+	int i;
+
+	for (i = 0; i < PAGE_SIZE / 4; i++)
+		sum = rol32(sum, 5) ^ READ_ONCE(p[i]);
+	return sum;
+}
+
+static void rapuyama_shm_scan(struct work_struct *work)
+{
+	unsigned int r, pg, npg, changed = 0, nonzero;
+	const u32 *p;
+	phys_addr_t pa;
+	u32 sum;
+
+	for (r = 0; r < ARRAY_SIZE(rapuyama_shm); r++) {
+		if (!rapuyama_shm_virt[r])
+			continue;
+		npg = rapuyama_shm[r].size >> PAGE_SHIFT;
+		nonzero = 0;
+		/* cached linear map: drop our lines so we see what the other
+		 * side wrote. we never write here, so nothing dirty is lost */
+		__cpuc_flush_dcache_area(rapuyama_shm_virt[r], rapuyama_shm[r].size);
+		for (pg = 0; pg < npg; pg++) {
+			p = rapuyama_shm_virt[r] + (pg << PAGE_SHIFT) / 4;
+			sum = rapuyama_shm_page_sum(p);
+			if (sum)
+				nonzero++;
+			pa = rapuyama_shm[r].base + (pg << PAGE_SHIFT);
+			if (rapuyama_shm_pass && sum != rapuyama_shm_sum[r][pg] &&
+			    changed++ < RY_SHM_MAXLOG)
+				pr_info("rapuyama: shm %pa changed: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+					&pa, p[0], p[1], p[2], p[3],
+					p[4], p[5], p[6], p[7]);
+			rapuyama_shm_sum[r][pg] = sum;
+			cond_resched();
+		}
+		if (!rapuyama_shm_pass)
+			pr_info("rapuyama: shm %pa +%zx: %u of %u pages not zero\n",
+				&rapuyama_shm[r].base, rapuyama_shm[r].size,
+				nonzero, npg);
+	}
+	if (changed > RY_SHM_MAXLOG)
+		pr_info("rapuyama: shm %u more pages changed\n",
+			changed - RY_SHM_MAXLOG);
+	rapuyama_shm_pass++;
+	schedule_delayed_work(&rapuyama_shm_work, RY_SHM_PERIOD);
+}
+
+static int __init rapuyama_shm_init(void)
+{
+	unsigned int r;
+
+	if (!rapuyama_shm_on || !of_machine_is_compatible("nokia,rapuyama"))
+		return 0;
+	for (r = 0; r < ARRAY_SIZE(rapuyama_shm); r++) {
+		/* reserved but mapped ram: this is just its linear map */
+		rapuyama_shm_virt[r] = memremap(rapuyama_shm[r].base,
+						rapuyama_shm[r].size,
+						MEMREMAP_WB);
+		rapuyama_shm_sum[r] = kcalloc(rapuyama_shm[r].size >> PAGE_SHIFT,
+					      sizeof(u32), GFP_KERNEL);
+		if (!rapuyama_shm_virt[r] || !rapuyama_shm_sum[r]) {
+			pr_warn("rapuyama: shm %pa not watched\n",
+				&rapuyama_shm[r].base);
+			if (rapuyama_shm_virt[r])
+				memunmap(rapuyama_shm_virt[r]);
+			kfree(rapuyama_shm_sum[r]);
+			rapuyama_shm_virt[r] = NULL;
+		}
+	}
+	INIT_DELAYED_WORK(&rapuyama_shm_work, rapuyama_shm_scan);
+	schedule_delayed_work(&rapuyama_shm_work, 0);
+	return 0;
+}
+late_initcall(rapuyama_shm_init);
 
 static const char *const rapuyama_dt_compat[] __initconst = {
 	"nokia,rapuyama",

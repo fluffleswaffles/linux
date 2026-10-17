@@ -633,8 +633,11 @@ config RAPUYAMA_MODEM
 	tristate "Nokia RapuYama modem keepalive"
 	depends on ARCH_RAPUYAMA
 	help
-	  Enable the RapuYama modem IRQ handler and periodically re-arm its
-	  interrupt. The SISA data transport is not implemented by this driver.
+	  Send the RapuYama modem the Energy-Management "awake" keepalive over
+	  its TX byte FIFO so the modem (the SoC reset master) does not warm-
+	  reset the chip ~50-210 s after Linux takes over from Symbian. Also
+	  brings up the modem interface clock and carries the SISA ring for a
+	  future two-way ISI stack.
 
 	  If unsure, say Y.
 endmenu

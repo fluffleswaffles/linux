@@ -596,6 +596,64 @@ static int __init rapuyama_shm_init(void)
 }
 late_initcall(rapuyama_shm_init);
 
+/*
+ * isasw handoff block from the booter (runblob_ldd.cpp SaveIsaHandoff): the
+ * cellular mcu sw runs on this cpu through karap's irq hooks, these are the
+ * hook addresses + the symbian mmu state they ran under. only logged for now,
+ * hosting the hooks needs to know what they are first
+ */
+#define RY_ISAH_PHYS	0x1f0f1000	/* between ramcon and the flight recorder */
+#define RY_ISAH_SIZE	0x5000
+#define RY_ISAH_L1	0x400		/* word index of the 16 kb L1 copy */
+#define RY_ISAH_MAGIC	0x48415349
+
+static int __init rapuyama_isah_init(void)
+{
+	const u32 *h;
+	int i;
+
+	if (!of_machine_is_compatible("nokia,rapuyama"))
+		return 0;
+	h = memremap(RY_ISAH_PHYS, RY_ISAH_SIZE, MEMREMAP_WB);
+	if (!h)
+		return 0;
+	if (h[0] != RY_ISAH_MAGIC) {
+		pr_info("rapuyama: isah: no handoff block (%08x)\n", h[0]);
+		goto out;
+	}
+	pr_info("rapuyama: isah v%u ttbr0=%08x ttbr1=%08x ttbcr=%08x dacr=%08x ctx=%08x sctlr=%08x prrr=%08x nmrr=%08x\n",
+		h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
+	for (i = 0; i < 6; i++)
+		pr_info("rapuyama: isah cb[%d]=%08x pa=%08x\n", i, h[0x10 + i], h[0xf0 + i]);
+	pr_info("rapuyama: isah obj=%08x pa=%08x\n", h[0x18], h[0xf6]);
+	for (i = 0; i < 0x40; i += 8)
+		pr_info("rapuyama: isah obj+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			i * 4, h[0x20 + i], h[0x21 + i], h[0x22 + i], h[0x23 + i],
+			h[0x24 + i], h[0x25 + i], h[0x26 + i], h[0x27 + i]);
+	for (i = 0; i < 0x40; i += 8)
+		pr_info("rapuyama: isah sisa+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			i * 4, h[0x60 + i], h[0x61 + i], h[0x62 + i], h[0x63 + i],
+			h[0x64 + i], h[0x65 + i], h[0x66 + i], h[0x67 + i]);
+	pr_info("rapuyama: isah superpage=%08x machinedata=%08x\n", h[0xa0], h[0xa1]);
+	for (i = 0; i < 0x40; i += 8)
+		pr_info("rapuyama: isah md+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+			i * 4, h[0xb0 + i], h[0xb1 + i], h[0xb2 + i], h[0xb3 + i],
+			h[0xb4 + i], h[0xb5 + i], h[0xb6 + i], h[0xb7 + i]);
+	/* the kernel L1 stays in the block (byte 0x1000), print only the sections
+	 * the hooks live in so the log stays short */
+	for (i = 0; i < 7; i++) {
+		u32 va = i < 6 ? h[0x10 + i] : h[0x18];
+
+		if (va)
+			pr_info("rapuyama: isah l1[%03x]=%08x (va %08x)\n",
+				va >> 20, h[RY_ISAH_L1 + (va >> 20)], va);
+	}
+out:
+	memunmap((void *)h);
+	return 0;
+}
+late_initcall(rapuyama_isah_init);
+
 static const char *const rapuyama_dt_compat[] __initconst = {
 	"nokia,rapuyama",
 	NULL

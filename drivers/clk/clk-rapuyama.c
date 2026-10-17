@@ -229,7 +229,7 @@ static void __init rapuyama_cgc_init(struct device_node *np)
 		/* everything hangs off the first clock of the node for now */
 		init.parent_data = &parent;
 		init.num_parents = 1;
-		init.flags = CLK_SET_RATE_PARENT |
+		init.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED |
 			     (r->critical ? CLK_IS_CRITICAL : 0);
 		c->hw.init = &init;
 

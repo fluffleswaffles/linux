@@ -686,6 +686,14 @@ config KEYBOARD_SPEAR
 	  To compile this driver as a module, choose M here: the
 	  module will be called spear-keyboard.
 
+config KEYBOARD_RAPUYAMA
+	tristate "Nokia E6 (RapuYama) keypad"
+	depends on I2C && OF
+	select INPUT_MATRIXKMAP
+	help
+	  Polled driver for the TC3589x keypad chip of the Nokia E6, keeping
+	  the setup the boot OS left in it.
+
 config KEYBOARD_TC3589X
 	tristate "TC3589X Keypad support"
 	depends on MFD_TC3589X

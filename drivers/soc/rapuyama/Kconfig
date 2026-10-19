@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config SOC_RAPUYAMA_VIDEOCORE
 	tristate "Nokia RapuYama BCM2727 VideoCore display"
-	depends on ARCH_RAPUYAMA && OF && FB
+	depends on ARCH_RAPUYAMA && OF && DRM
 	depends on GPIOLIB && COMMON_CLK
 	select FW_LOADER
-	select FB_SYSMEM_HELPERS_DEFERRED
+	select DRM_KMS_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select BACKLIGHT_CLASS_DEVICE
 	help
 	  Boots the BCM2727 VideoCore of the Nokia E6 over the ViSSI host bus
 	  (firmware vc/vc-loader-a and vc/vc-main, extracted from the Symbian
 	  ROM with vc_extract.py), brings the LCD panel up and exposes a
-	  640x480 framebuffer that is pushed to the VideoCore on every change.
+	  640x480 KMS device (and fbdev through the drm emulation) whose
+	  plane is pushed to the VideoCore on every change.
 
 	  If unsure, say N.

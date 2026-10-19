@@ -96,6 +96,14 @@ static int rapuyama_keypad_probe(struct i2c_client *client)
 		return dev_err_probe(dev, ret, "bad linux,keymap\n");
 	input_set_capability(kp->input, EV_MSC, MSC_SCAN);
 	__set_bit(EV_REP, kp->input->evbit);
+	/*
+	 * udev (and libudev-zero) call a device a keyboard only if it has
+	 * all of KEY_ESC..KEY_S, else libinput and weston ignore it. the
+	 * qwerty has no digit row (digits are Fn + letters in xkb), so
+	 * claim them, they just never fire
+	 */
+	for (ret = KEY_ESC; ret <= KEY_S; ret++)
+		__set_bit(ret, kp->input->keybit);
 	input_set_drvdata(kp->input, kp);
 
 	ret = input_setup_polling(kp->input, rapuyama_keypad_poll);

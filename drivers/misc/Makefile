@@ -71,10 +71,13 @@ obj-$(CONFIG_TPS6594_ESM)	+= tps6594-esm.o
 obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
 obj-$(CONFIG_NSM)		+= nsm.o
 obj-$(CONFIG_MARVELL_CN10K_DPI)	+= mrvl_cn10k_dpi.o
+# all the modem experiments, only with RAPUYAMA_MODEM: keepalive pokes the
+# pmic over cbus next to rapuyama_wdt (no shared lock), theories/isasw touch
+# modem-side regs. the boot deaths started with them (18.10.2026)
 obj-$(CONFIG_RAPUYAMA_MODEM) += rapuyama_modem.o
-obj-$(CONFIG_ARCH_RAPUYAMA)	+= rapuyama_keepalive.o
-obj-$(CONFIG_ARCH_RAPUYAMA)	+= rapuyama_variant.o
+obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_keepalive.o
+obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_variant.o
 obj-y				+= keba/
-obj-$(CONFIG_ARCH_RAPUYAMA)	+= rapuyama_sweep.o
-obj-$(CONFIG_ARCH_RAPUYAMA)	+= rapuyama_theories.o
-obj-$(CONFIG_ARCH_RAPUYAMA)	+= rapuyama_isasw.o
+obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_sweep.o
+obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_theories.o
+obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_isasw.o

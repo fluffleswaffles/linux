@@ -1229,6 +1229,14 @@ static struct omap_i2c_bus_platform_data omap2420_pdata = {
 			OMAP_I2C_FLAG_BUS_SHIFT_2,
 };
 
+/* Nokia RapuYama (E6): omap2420 with an 8 bit DATA reg */
+static struct omap_i2c_bus_platform_data rapuyama_pdata = {
+	.rev = OMAP_I2C_IP_VERSION_1,
+	.flags = OMAP_I2C_FLAG_NO_FIFO |
+			OMAP_I2C_FLAG_SIMPLE_CLOCK |
+			OMAP_I2C_FLAG_BUS_SHIFT_2,
+};
+
 static struct omap_i2c_bus_platform_data omap2430_pdata = {
 	.rev = OMAP_I2C_IP_VERSION_1,
 	.flags = OMAP_I2C_FLAG_BUS_SHIFT_2 |
@@ -1260,6 +1268,10 @@ static const struct of_device_id omap_i2c_of_match[] = {
 	{
 		.compatible = "ti,omap2420-i2c",
 		.data = &omap2420_pdata,
+	},
+	{
+		.compatible = "nokia,rapuyama-i2c",
+		.data = &rapuyama_pdata,
 	},
 	{ }
 };

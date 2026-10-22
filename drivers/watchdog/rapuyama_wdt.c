@@ -35,6 +35,7 @@
 #include <linux/reboot.h>
 #include <linux/spinlock.h>
 #include <linux/watchdog.h>
+#include <linux/workqueue.h>
 
 #define CBUS_EN		0x04
 #define CBUS_BUSY	0x08
@@ -65,6 +66,8 @@ struct rapuyama_wdt {
 	void __iomem *soc;
 	void __iomem *reset;	/* optional */
 	spinlock_t lock;
+	struct delayed_work dump;
+	u16 pmic_last[2][32];
 };
 
 #ifdef CONFIG_ARCH_RAPUYAMA
@@ -107,6 +110,66 @@ static int rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 	writel(0, rw->cbus + CBUS_EN);
 	spin_unlock_irqrestore(&rw->lock, flags);
 	return ret;
+}
+
+/* karap FUN_800b8414: no write mode, read flag 0x20 in the cmd */
+static int rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
+			      u16 *val)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&rw->lock, flags);
+	writel(1, rw->cbus + CBUS_EN);
+	writel(16 - 1, rw->cbus + CBUS_BITS);
+	writel(dev << 6 | reg | CBUS_READ, rw->cbus + CBUS_RD_CMD);
+	ret = rapuyama_cbus_wait(rw);
+	if (!ret)
+		*val = readl(rw->cbus + CBUS_DATA);
+	writel(0, rw->cbus + CBUS_EN);
+	spin_unlock_irqrestore(&rw->lock, flags);
+	return ret;
+}
+
+/*
+ * the reset comes 240 s after symbian's last ~210 s service, maybe a pmic
+ * timer: log every pmic reg that changed, period in s, 0 = off. only the regs
+ * karap's cbus table (0x800bc268) knows
+ */
+static unsigned int pmic_dump = 10;
+module_param(pmic_dump, uint, 0444);
+
+static const u32 rapuyama_pmic_regs[2] = {
+	0x70dbe77f,	/* dev 1: 0-6 8-a d-11 13 14 16 17 1c-1e */
+	0xff7ff7ff,	/* dev 2: 0-a c-16 18-1f */
+};
+
+static void rapuyama_pmic_dump(struct work_struct *work)
+{
+	struct rapuyama_wdt *rw = container_of(to_delayed_work(work),
+					       struct rapuyama_wdt, dump);
+	static bool first = true;
+	char buf[512];
+	int len = 0;
+	u32 d, r;
+	u16 v;
+
+	for (d = 0; d < 2; d++) {
+		for (r = 0; r < 32; r++) {
+			if (!(rapuyama_pmic_regs[d] & BIT(r)))
+				continue;
+			if (rapuyama_cbus_read(rw, d + 1, r, &v))
+				continue;
+			if (!first && v == rw->pmic_last[d][r])
+				continue;
+			len += scnprintf(buf + len, sizeof(buf) - len,
+					 " %u.%02x:%04x", d + 1, r, v);
+			rw->pmic_last[d][r] = v;
+		}
+	}
+	first = false;
+	pr_info("rapuyama-wdt: pmic%s\n", len ? buf : " -");
+	schedule_delayed_work(&rw->dump, msecs_to_jiffies(pmic_dump * 1000));
 }
 
 static int rapuyama_wdt_ping(struct watchdog_device *wdd)
@@ -226,6 +289,11 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 						    rapuyama_wdt_restart, rw);
 		if (ret)
 			dev_warn(dev, "no restart handler: %d\n", ret);
+	}
+
+	if (pmic_dump) {
+		INIT_DELAYED_WORK(&rw->dump, rapuyama_pmic_dump);
+		schedule_delayed_work(&rw->dump, 0);
 	}
 
 	dev_info(dev, "pmic + soc watchdog, %u s\n", rw->wdd.timeout);

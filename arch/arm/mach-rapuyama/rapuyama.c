@@ -12,12 +12,15 @@
  */
 
 #include <linux/init.h>
+#include <linux/debugfs.h>
+#include <linux/fs.h>
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kernel_stat.h>
+#include <linux/math64.h>
 #include <linux/irqflags.h>
 #include <linux/console.h>
 #include <linux/kmsg_dump.h>
@@ -216,6 +219,32 @@ early_param("e6.wdtfeed", rapuyama_wdtfeed_param);
  */
 static unsigned int rapuyama_stall_s = 5;
 static unsigned int rapuyama_alive_ticks;
+
+/*
+ * phase calibration from the booter (boot_app RB_CALIB, isah block words
+ * 0x100..): the 32 khz fast counter at the handoff and at the last secure
+ * request symbian sent. the counter runs on across the handoff, so the
+ * heartbeat can say how long ago both were
+ */
+#define RY_FC		0x33350
+#define RY_FC_LATCH	0x33354
+static u32 rapuyama_calib_fc_handoff, rapuyama_calib_fc_req;
+static u32 rapuyama_calib_reqs;
+static bool rapuyama_calib_ok;
+/* calibration v2 */
+static int rapuyama_calib_due_ms;
+static bool rapuyama_calib_due_ok;
+/* calibration v3 */
+static u32 rapuyama_calib_kick_fc;
+static bool rapuyama_calib_kick_ok;
+/* calibration v2 */
+static u32 rapuyama_calib_sym_ms;
+
+static u32 rapuyama_fc(void)
+{
+	writel_relaxed(0xc6033354u, RY_BUS(RY_FC_LATCH));
+	return readl_relaxed(RY_BUS(RY_FC));
+}
 static unsigned long rapuyama_last_ping;
 static bool rapuyama_pinged;
 static bool rapuyama_stall_dumped;
@@ -298,6 +327,30 @@ static void rapuyama_raw_irq_counts(void)
 	}
 }
 
+/* irqs that fired since the last call, so a lone modem event before the reset shows up */
+static unsigned int rapuyama_irq_last[512];
+
+static void rapuyama_raw_irq_deltas(void)
+{
+	struct irq_desc *desc;
+	unsigned int i, n;
+	char buf[256];
+	int len = 0;
+
+	for_each_irq_desc(i, desc) {
+		if (i >= ARRAY_SIZE(rapuyama_irq_last))
+			break;
+		n = kstat_irqs_cpu(i, 0);
+		if (n == rapuyama_irq_last[i])
+			continue;
+		len += scnprintf(buf + len, sizeof(buf) - len, " %u/%lu:%u", i,
+				 desc->irq_data.hwirq, n - rapuyama_irq_last[i]);
+		rapuyama_irq_last[i] = n;
+	}
+	buf[len] = 0;
+	rapuyama_raw_printf("e6: irqs (irq/hwirq:n)%s\n", buf);
+}
+
 /*
  * the console may be what is stuck (console_sem held forever, nothing gets
  * printed while the kernel runs on), so after the dump copy the whole printk
@@ -378,13 +431,43 @@ static void rapuyama_stall_check(void)
  * shows how long linux lived. replaces the old init.sh one, which spammed
  * the console every 10 s
  */
+static void rapuyama_raw_reg_changes(void);
+
 static void rapuyama_alive(void)
 {
+	unsigned int up;
+	u32 fc;
+
 	if (++rapuyama_alive_ticks < 100)
 		return;
 	rapuyama_alive_ticks = 0;
-	rapuyama_raw_printf("e6: alive, uptime %u s\n",
-			    jiffies_to_msecs(jiffies - INITIAL_JIFFIES) / 1000);
+	up = jiffies_to_msecs(jiffies - INITIAL_JIFFIES) / 1000;
+	if (!READ_ONCE(rapuyama_calib_ok)) {
+		rapuyama_raw_printf("e6: alive, uptime %u s\n", up);
+		rapuyama_raw_irq_deltas();
+		rapuyama_raw_reg_changes();
+		return;
+	}
+	fc = rapuyama_fc();
+	if (rapuyama_calib_due_ok)
+		rapuyama_raw_printf("e6: alive, uptime %u s, %u s after the handoff, symbian uptime %u s\n",
+				    up, (fc - rapuyama_calib_fc_handoff) >> 15,
+				    (rapuyama_calib_sym_ms +
+				     (u32)(((u64)(fc - rapuyama_calib_fc_handoff) * 1000) >> 15)) / 1000);
+	else if (rapuyama_calib_due_ok)
+		rapuyama_raw_printf("e6: alive, uptime %u s, %u s after the handoff, %d s after the secure request was due\n",
+				    up, (fc - rapuyama_calib_fc_handoff) >> 15,
+				    (int)(((u64)(fc - rapuyama_calib_fc_handoff) * 1000) >> 15) / 1000 -
+				    rapuyama_calib_due_ms / 1000);
+	else if (rapuyama_calib_reqs)
+		rapuyama_raw_printf("e6: alive, uptime %u s, %u s after the handoff, %u s after the last secure request\n",
+				    up, (fc - rapuyama_calib_fc_handoff) >> 15,
+				    (fc - rapuyama_calib_fc_req) >> 15);
+	else
+		rapuyama_raw_printf("e6: alive, uptime %u s, %u s after the handoff\n",
+				    up, (fc - rapuyama_calib_fc_handoff) >> 15);
+	rapuyama_raw_irq_deltas();
+	rapuyama_raw_reg_changes();
 }
 
 /*
@@ -423,6 +506,8 @@ static const u32 rapuyama_fr_regs[] = {
 #define RY_FR_NSLOTS	((0x100000u - RY_FR_OFF - RY_FR_DATA) / RY_FR_SLOT)
 
 static u32 rapuyama_fr_seq;
+/* bits that moved since the heartbeat last printed them, per fr reg */
+static u32 rapuyama_fr_prev[RY_FR_NREGS], rapuyama_fr_chg[RY_FR_NREGS];
 
 static void rapuyama_flight_record(void)
 {
@@ -441,10 +526,33 @@ static void rapuyama_flight_record(void)
 	slot = fr + RY_FR_DATA + (rapuyama_fr_seq % RY_FR_NSLOTS) * RY_FR_SLOT;
 	writel(rapuyama_fr_seq, slot);
 	writel(jiffies_to_msecs(jiffies - INITIAL_JIFFIES), slot + 4);
-	for (i = 0; i < RY_FR_NREGS; i++)
-		writel(readl_relaxed(RY_BUS(rapuyama_fr_regs[i])),
-		       slot + 8 + i * 4);
+	for (i = 0; i < RY_FR_NREGS; i++) {
+		u32 v = readl_relaxed(RY_BUS(rapuyama_fr_regs[i]));
+
+		writel(v, slot + 8 + i * 4);
+		if (rapuyama_fr_seq)
+			rapuyama_fr_chg[i] |= v ^ rapuyama_fr_prev[i];
+		rapuyama_fr_prev[i] = v;
+	}
 	writel(++rapuyama_fr_seq, fr + 4);
+}
+
+/* the counters (first two regs) always move, skip them */
+static void rapuyama_raw_reg_changes(void)
+{
+	char buf[384];
+	unsigned int i;
+	int len = 0;
+
+	for (i = 2; i < RY_FR_NREGS; i++) {
+		if (!rapuyama_fr_chg[i])
+			continue;
+		len += scnprintf(buf + len, sizeof(buf) - len, " %x:%08x",
+				 rapuyama_fr_regs[i], rapuyama_fr_chg[i]);
+		rapuyama_fr_chg[i] = 0;
+	}
+	buf[len] = 0;
+	rapuyama_raw_printf("e6: bits (reg:changed)%s\n", buf);
 }
 
 /* called from the ms timer irq every ~100 ms */
@@ -508,6 +616,7 @@ static const struct {
 static bool rapuyama_shm_on = true;
 static u32 *rapuyama_shm_virt[ARRAY_SIZE(rapuyama_shm)];
 static u32 *rapuyama_shm_sum[ARRAY_SIZE(rapuyama_shm)];
+static struct debugfs_blob_wrapper rapuyama_shm_blob[ARRAY_SIZE(rapuyama_shm)];
 static unsigned int rapuyama_shm_pass;
 static struct delayed_work rapuyama_shm_work;
 
@@ -568,12 +677,28 @@ static void rapuyama_shm_scan(struct work_struct *work)
 	schedule_delayed_work(&rapuyama_shm_work, RY_SHM_PERIOD);
 }
 
+static ssize_t rapuyama_shm_read(struct file *file, char __user *buf,
+			       size_t count, loff_t *pos)
+{
+	struct debugfs_blob_wrapper *blob = file->private_data;
+
+	return simple_read_from_buffer(buf, count, pos, blob->data, blob->size);
+}
+
+static const struct file_operations rapuyama_shm_fops = {
+	.open = simple_open,
+	.read = rapuyama_shm_read,
+	.llseek = default_llseek,
+};
+
 static int __init rapuyama_shm_init(void)
 {
+	struct dentry *dir;
 	unsigned int r;
 
 	if (!rapuyama_shm_on || !of_machine_is_compatible("nokia,rapuyama"))
 		return 0;
+	dir = debugfs_create_dir("rapuyama-shm", NULL);
 	for (r = 0; r < ARRAY_SIZE(rapuyama_shm); r++) {
 		/* reserved but mapped ram: this is just its linear map */
 		rapuyama_shm_virt[r] = memremap(rapuyama_shm[r].base,
@@ -588,6 +713,15 @@ static int __init rapuyama_shm_init(void)
 				memunmap(rapuyama_shm_virt[r]);
 			kfree(rapuyama_shm_sum[r]);
 			rapuyama_shm_virt[r] = NULL;
+		}
+		if (rapuyama_shm_virt[r] && !IS_ERR_OR_NULL(dir)) {
+			char name[16];
+
+			snprintf(name, sizeof(name), "%08x", (u32)rapuyama_shm[r].base);
+			rapuyama_shm_blob[r].data = rapuyama_shm_virt[r];
+			rapuyama_shm_blob[r].size = rapuyama_shm[r].size;
+			debugfs_create_file(name, 0400, dir, &rapuyama_shm_blob[r],
+					    &rapuyama_shm_fops);
 		}
 	}
 	INIT_DELAYED_WORK(&rapuyama_shm_work, rapuyama_shm_scan);
@@ -606,6 +740,8 @@ late_initcall(rapuyama_shm_init);
 #define RY_ISAH_SIZE	0x5000
 #define RY_ISAH_L1	0x400		/* word index of the 16 kb L1 copy */
 #define RY_ISAH_MAGIC	0x48415349
+#define RY_CALIB	0x100		/* word index of the phase calibration */
+#define RY_CALIB_MAGIC	0x424c4143	/* 'CALB' */
 
 static int __init rapuyama_isah_init(void)
 {
@@ -617,6 +753,36 @@ static int __init rapuyama_isah_init(void)
 	h = memremap(RY_ISAH_PHYS, RY_ISAH_SIZE, MEMREMAP_WB);
 	if (!h)
 		return 0;
+	if (h[RY_CALIB] == RY_CALIB_MAGIC) {
+		const u32 *c = h + RY_CALIB;
+
+		rapuyama_calib_fc_handoff = c[2];
+		rapuyama_calib_fc_req = c[3];
+		rapuyama_calib_reqs = c[4];
+		if (c[1] >= 2 && c[5] != 0xffffffff && c[5] != 0) {
+			rapuyama_calib_due_ms = (int)(c[6] - c[7]) * (int)c[8] / 1000;
+			rapuyama_calib_sym_ms = div_u64((u64)c[7] * c[8], 1000);
+			rapuyama_calib_due_ok = true;
+		}
+		if (c[1] >= 2)
+			pr_info("rapuyama: calib: secure timer state %x trigger %u tick %u period %u us -> next request %d ms after the handoff\n",
+				c[5], c[6], c[7], c[8], rapuyama_calib_due_ms);
+		if (c[1] >= 3 && c[9] != 1) {
+			rapuyama_calib_kick_fc = c[10];
+			rapuyama_calib_kick_ok = true;
+			pr_info("rapuyama: calib: request sent at the handoff -> %d, %u ms before the handoff\n",
+				(int)c[9], (u32)(((u64)(c[2] - c[10]) * 1000) >> 15));
+		}
+		WRITE_ONCE(rapuyama_calib_ok, true);
+		if (c[4])
+			pr_info("rapuyama: calib v%u: handoff fc=%08x, last secure request fc=%08x (%u ms before the handoff, %u sightings), cmd=%08x PAid=%08x\n",
+				c[1], c[2], c[3],
+				(u32)(((u64)(c[2] - c[3]) * 1000) >> 15), c[4],
+				c[0x10], c[0x11]);
+		else
+			pr_info("rapuyama: calib v%u: handoff fc=%08x, no secure request seen\n",
+				c[1], c[2]);
+	}
 	if (h[0] != RY_ISAH_MAGIC) {
 		pr_info("rapuyama: isah: no handoff block (%08x)\n", h[0]);
 		goto out;

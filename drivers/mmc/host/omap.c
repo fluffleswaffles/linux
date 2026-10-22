@@ -138,6 +138,7 @@ struct mmc_omap_host {
 	int			irq;
 	unsigned char		bus_mode;
 	unsigned int		reg_shift;
+	unsigned int		sdio_0x20:1;	/* nokia,rapuyama-mmc */
 	struct gpio_desc	*slot_switch;
 
 	struct work_struct	cmd_abort_work;
@@ -695,6 +696,9 @@ mmc_omap_xfer_data(struct mmc_omap_host *host, int write)
 		__raw_readsw(host->virt_base + OMAP_MMC_REG(host, DATA),
 			     buffer, nwords);
 	}
+
+	/* atomic mapping must be released before leaving this IRQ */
+	sg_miter_stop(sgm);
 }
 
 #ifdef CONFIG_MMC_DEBUG
@@ -1228,6 +1232,9 @@ static void mmc_omap_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	for (i = 0; i < 2; i++)
 		OMAP_MMC_WRITE(host, CON, dsor);
 	slot->saved_con = dsor;
+	/* EPBUSMV sets SDIO bit 5 after every divider write */
+	if (host->sdio_0x20)
+		OMAP_MMC_WRITE(host, SDIO, OMAP_MMC_READ(host, SDIO) | 0x20);
 	if (init_stream) {
 		/* worst case at 400kHz, 80 cycles makes 200 microsecs */
 		int usecs = 250;
@@ -1291,6 +1298,8 @@ static int mmc_omap_new_slot(struct mmc_omap_host *host, int id)
 	mmc->caps = 0;
 	if (host->pdata->slots[id].wires >= 4)
 		mmc->caps |= MMC_CAP_4_BIT_DATA;
+	if (of_property_read_bool(host->dev->of_node, "broken-cd"))
+		mmc->caps |= MMC_CAP_NEEDS_POLL;
 
 	mmc->ops = &mmc_omap_ops;
 	mmc->f_min = 400000;
@@ -1491,6 +1500,8 @@ static int mmc_omap_probe(struct platform_device *pdev)
 
 	host->nr_slots = pdata->nr_slots;
 	host->reg_shift = (mmc_omap7xx() ? 1 : 2);
+	host->sdio_0x20 = of_device_is_compatible(pdev->dev.of_node,
+						 "nokia,rapuyama-mmc");
 
 	host->mmc_omap_wq = alloc_workqueue("mmc_omap", 0, 0);
 	if (!host->mmc_omap_wq) {
@@ -1562,6 +1573,7 @@ static void mmc_omap_remove(struct platform_device *pdev)
 
 #if IS_BUILTIN(CONFIG_OF)
 static const struct of_device_id mmc_omap_match[] = {
+	{ .compatible = "nokia,rapuyama-mmc", },
 	{ .compatible = "ti,omap2420-mmc", },
 	{ },
 };

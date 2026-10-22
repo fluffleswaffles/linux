@@ -1121,6 +1121,17 @@ static int omap_i2c_xfer_data(struct omap_i2c_dev *omap)
 			break;
 		}
 
+		/* a pending data IRQ may arrive before the first transfer */
+		if (!omap->buf_len && (stat & (OMAP_I2C_STAT_RDR |
+				OMAP_I2C_STAT_RRDY | OMAP_I2C_STAT_XDR |
+				OMAP_I2C_STAT_XRDY))) {
+			omap_i2c_ack_stat(omap, stat & (OMAP_I2C_STAT_RDR |
+				OMAP_I2C_STAT_RRDY | OMAP_I2C_STAT_XDR |
+				OMAP_I2C_STAT_XRDY));
+			err = -EAGAIN;
+			break;
+		}
+
 		if (stat & OMAP_I2C_STAT_RDR) {
 			u8 num_bytes = 1;
 

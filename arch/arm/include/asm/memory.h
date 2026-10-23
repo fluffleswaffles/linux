@@ -385,7 +385,16 @@ static inline unsigned long __virt_to_idmap(unsigned long x)
  *  virt_to_page(k)	convert a _valid_ virtual address to struct page *
  *  virt_addr_valid(k)	indicates whether a virtual address is valid
  */
+#ifdef CONFIG_ARCH_RAPUYAMA
+/*
+ * rapuyama keeps PHYS_OFFSET below the start of ram (big TEXT_OFFSET), the
+ * flatmem mem_map has to start at the first ram pfn, set in arm_memblock_init
+ */
+extern unsigned long arm_ram_pfn_offset;
+#define ARCH_PFN_OFFSET		arm_ram_pfn_offset
+#else
 #define ARCH_PFN_OFFSET		PHYS_PFN_OFFSET
+#endif
 
 #define virt_to_page(kaddr)	pfn_to_page(virt_to_pfn(kaddr))
 #define virt_addr_valid(kaddr)	(((unsigned long)(kaddr) >= PAGE_OFFSET && (unsigned long)(kaddr) < (unsigned long)high_memory) \

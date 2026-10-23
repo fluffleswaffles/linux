@@ -932,6 +932,13 @@ config I2C_OCORES
 	  This driver can also be built as a module.  If so, the module
 	  will be called i2c-ocores.
 
+config I2C_RAPUYAMA_HS
+	tristate "Nokia RapuYama HS I2C"
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	select I2C_ALGOBIT
+	help
+	  HS I2C port 3, used by the battery charger on the Nokia E6
+
 config I2C_OMAP
 	tristate "OMAP I2C adapter"
 	depends on ARCH_OMAP || ARCH_K3 || ARCH_RAPUYAMA || COMPILE_TEST

@@ -27,12 +27,14 @@
  * running and the watchdog core keeps it fed until userspace takes over.
  */
 
+#include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
+#include <linux/soc/rapuyama-pmic.h>
 #include <linux/spinlock.h>
 #include <linux/watchdog.h>
 #include <linux/workqueue.h>
@@ -94,13 +96,12 @@ static int rapuyama_cbus_wait(struct rapuyama_wdt *rw)
 	return 0;
 }
 
-static int rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
-			       u16 val)
+/* rw->lock held */
+static int __rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
+				 u16 val)
 {
-	unsigned long flags;
 	int ret;
 
-	spin_lock_irqsave(&rw->lock, flags);
 	writel(1, rw->cbus + CBUS_EN);
 	writel(1, rw->cbus + CBUS_WR_MODE);
 	writel(16 - 1, rw->cbus + CBUS_BITS);
@@ -108,18 +109,28 @@ static int rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 	writel(dev << 6 | reg, rw->cbus + CBUS_WR_CMD);
 	ret = rapuyama_cbus_wait(rw);
 	writel(0, rw->cbus + CBUS_EN);
-	spin_unlock_irqrestore(&rw->lock, flags);
 	return ret;
 }
 
-/* karap FUN_800b8414: no write mode, read flag 0x20 in the cmd */
-static int rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
-			      u16 *val)
+static int rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
+			       u16 val)
 {
 	unsigned long flags;
 	int ret;
 
 	spin_lock_irqsave(&rw->lock, flags);
+	ret = __rapuyama_cbus_write(rw, dev, reg, val);
+	spin_unlock_irqrestore(&rw->lock, flags);
+	return ret;
+}
+
+/* karap FUN_800b8414: no write mode, read flag 0x20 in the cmd */
+/* rw->lock held */
+static int __rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
+				u16 *val)
+{
+	int ret;
+
 	writel(1, rw->cbus + CBUS_EN);
 	writel(16 - 1, rw->cbus + CBUS_BITS);
 	writel(dev << 6 | reg | CBUS_READ, rw->cbus + CBUS_RD_CMD);
@@ -127,16 +138,104 @@ static int rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 	if (!ret)
 		*val = readl(rw->cbus + CBUS_DATA);
 	writel(0, rw->cbus + CBUS_EN);
+	return ret;
+}
+
+static int rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
+			      u16 *val)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&rw->lock, flags);
+	ret = __rapuyama_cbus_read(rw, dev, reg, val);
 	spin_unlock_irqrestore(&rw->lock, flags);
 	return ret;
 }
+
+/*
+ * gazoo adc (isasw hw_ad.c FUN_c62eff18): dev 1 reg 8, bit 10 = on, bits
+ * 15:11 = hw channel, bits 9:0 = the result right after. the same steps as
+ * the modem's energy management, under one lock with irqs off
+ */
+#define PMIC_REG_ADC	0x08
+#define PMIC_ADC_ON	BIT(10)
+#define PMIC_ADC_CH	GENMASK(15, 11)
+#define PMIC_ADC_RES	GENMASK(9, 0)
+#define PMIC_ADC_NCH	19		/* hw channels isasw maps to */
+
+static int rapuyama_adc_read(struct rapuyama_wdt *rw, unsigned int ch, u16 *raw)
+{
+	unsigned long flags;
+	u16 v;
+	int ret;
+
+	spin_lock_irqsave(&rw->lock, flags);
+	ret = __rapuyama_cbus_read(rw, PMIC_DEV, PMIC_REG_ADC, &v);
+	if (!ret)
+		ret = __rapuyama_cbus_write(rw, PMIC_DEV, PMIC_REG_ADC,
+					    v | PMIC_ADC_ON);
+	if (!ret)
+		ret = __rapuyama_cbus_write(rw, PMIC_DEV, PMIC_REG_ADC,
+					    (v & ~PMIC_ADC_CH) | PMIC_ADC_ON |
+					    FIELD_PREP(PMIC_ADC_CH, ch));
+	if (!ret)
+		ret = __rapuyama_cbus_read(rw, PMIC_DEV, PMIC_REG_ADC, &v);
+	if (!ret) {
+		*raw = FIELD_GET(PMIC_ADC_RES, v);
+		ret = __rapuyama_cbus_write(rw, PMIC_DEV, PMIC_REG_ADC,
+					    v & ~PMIC_ADC_ON);
+	}
+	spin_unlock_irqrestore(&rw->lock, flags);
+	return ret;
+}
+
+static struct rapuyama_wdt *rapuyama_pmic;
+
+/* for drivers/power/supply/rapuyama-battery.c */
+int rapuyama_pmic_adc(unsigned int ch, u16 *raw)
+{
+	struct rapuyama_wdt *rw = READ_ONCE(rapuyama_pmic);
+
+	if (!rw)
+		return -EPROBE_DEFER;
+	if (ch >= PMIC_ADC_NCH)
+		return -EINVAL;
+	return rapuyama_adc_read(rw, ch, raw);
+}
+EXPORT_SYMBOL_GPL(rapuyama_pmic_adc);
+
+/* all hw channels raw, to tell which is which (vbat, btemp, bsi, vchar) */
+static ssize_t adc_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct rapuyama_wdt *rw = dev_get_drvdata(dev);
+	unsigned int ch;
+	int len = 0;
+	u16 raw;
+
+	for (ch = 0; ch < PMIC_ADC_NCH; ch++) {
+		if (rapuyama_adc_read(rw, ch, &raw))
+			len += sysfs_emit_at(buf, len, "%2u -\n", ch);
+		else
+			len += sysfs_emit_at(buf, len, "%2u %4u\n", ch, raw);
+	}
+	return len;
+}
+static DEVICE_ATTR_RO(adc);
+
+static struct attribute *rapuyama_wdt_attrs[] = {
+	&dev_attr_adc.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(rapuyama_wdt);
 
 /*
  * the reset comes 240 s after symbian's last ~210 s service, maybe a pmic
  * timer: log every pmic reg that changed, period in s, 0 = off. only the regs
  * karap's cbus table (0x800bc268) knows
  */
-static unsigned int pmic_dump = 10;
+static unsigned int pmic_dump;
 module_param(pmic_dump, uint, 0444);
 
 static const u32 rapuyama_pmic_regs[2] = {
@@ -240,6 +339,7 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	rw = devm_kzalloc(dev, sizeof(*rw), GFP_KERNEL);
 	if (!rw)
 		return -ENOMEM;
+	platform_set_drvdata(pdev, rw);
 
 	rw->cbus = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(rw->cbus))
@@ -296,6 +396,7 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 		schedule_delayed_work(&rw->dump, 0);
 	}
 
+	WRITE_ONCE(rapuyama_pmic, rw);
 	dev_info(dev, "pmic + soc watchdog, %u s\n", rw->wdd.timeout);
 	return 0;
 }
@@ -311,6 +412,7 @@ static struct platform_driver rapuyama_wdt_driver = {
 	.driver = {
 		.name = "rapuyama-wdt",
 		.of_match_table = rapuyama_wdt_of_match,
+		.dev_groups = rapuyama_wdt_groups,
 	},
 };
 /*

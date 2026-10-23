@@ -25,6 +25,10 @@
 #include <linux/platform_device.h>
 #include <linux/usb/usb_phy_generic.h>
 
+#include <linux/power_supply.h>
+#include <linux/soc/rapuyama-usb.h>
+#include <linux/workqueue.h>
+
 #include "musb_core.h"
 
 #define RY_OTG_REVISION		0x400
@@ -116,6 +120,36 @@ static irqreturn_t rapuyama_musb_interrupt(int irq, void *__hci)
 	return ret;
 }
 
+/* gadget current budget, zero before enumeration and during suspend */
+static unsigned int rapuyama_usb_ma;
+
+unsigned int rapuyama_usb_current_ma(void)
+{
+	return READ_ONCE(rapuyama_usb_ma);
+}
+EXPORT_SYMBOL_GPL(rapuyama_usb_current_ma);
+
+static void rapuyama_usb_power_changed(struct work_struct *work)
+{
+	struct power_supply *psy;
+
+	if (!IS_REACHABLE(CONFIG_POWER_SUPPLY))
+		return;
+	psy = power_supply_get_by_name("usb");
+	if (psy) {
+		power_supply_changed(psy);
+		power_supply_put(psy);
+	}
+}
+static DECLARE_WORK(rapuyama_usb_power_work, rapuyama_usb_power_changed);
+
+static int rapuyama_usb_set_power(struct usb_phy *phy, unsigned int ma)
+{
+	WRITE_ONCE(rapuyama_usb_ma, min(ma, 500u));
+	schedule_work(&rapuyama_usb_power_work);
+	return 0;
+}
+
 static int rapuyama_musb_init(struct musb *musb)
 {
 	struct device *dev = musb->controller;
@@ -136,6 +170,7 @@ static int rapuyama_musb_init(struct musb *musb)
 		return ret;
 	}
 
+	musb->xceiv->set_power = rapuyama_usb_set_power;
 	musb->isr = rapuyama_musb_interrupt;
 
 	/* bring-up: what the core looks like, devctl bit 3..4 = vbus level */
@@ -148,6 +183,9 @@ static int rapuyama_musb_init(struct musb *musb)
 
 static int rapuyama_musb_exit(struct musb *musb)
 {
+	musb->xceiv->set_power = NULL;
+	WRITE_ONCE(rapuyama_usb_ma, 0);
+	cancel_work_sync(&rapuyama_usb_power_work);
 	return 0;
 }
 

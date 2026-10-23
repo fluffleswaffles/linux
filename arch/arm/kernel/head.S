@@ -65,7 +65,8 @@ kernel_sec_end:
 	.popsection
 
 	.macro	pgtbl, rd, phys
-	add	\rd, \phys, #TEXT_OFFSET
+	add	\rd, \phys, #(TEXT_OFFSET & 0xffff)
+	add	\rd, \rd, #(TEXT_OFFSET & ~0xffff)	@ two imm8s for a big one
 	sub	\rd, \rd, #PG_DIR_SIZE
 	.endm
 
@@ -120,7 +121,8 @@ ENTRY(stext)
 
 #ifndef CONFIG_XIP_KERNEL
 	adr_l	r8, _text			@ __pa(_text)
-	sub	r8, r8, #TEXT_OFFSET		@ PHYS_OFFSET
+	sub	r8, r8, #(TEXT_OFFSET & 0xffff)
+	sub	r8, r8, #(TEXT_OFFSET & ~0xffff)	@ PHYS_OFFSET
 #else
 	ldr	r8, =PLAT_PHYS_OFFSET		@ always constant in this case
 #endif
@@ -250,19 +252,27 @@ __create_page_tables:
 	 * set two variables to indicate the physical start and end of the
 	 * kernel.
 	 */
-	add	r0, r4, #KERNEL_OFFSET >> (SECTION_SHIFT - PMD_ENTRY_ORDER)
+	/*
+	 * Start at the kernel's own section, not at PHYS_OFFSET: with a
+	 * TEXT_OFFSET above a section (rapuyama) the gap below the kernel
+	 * can hold things that must not get a cacheable mapping.
+	 */
+	ldr	r0, =(KERNEL_OFFSET + (TEXT_OFFSET & 0xfff00000)) >> (SECTION_SHIFT - PMD_ENTRY_ORDER)
+	add	r0, r4, r0
 	ldr	r6, =(_end - 1)
+	ldr	r3, =(TEXT_OFFSET & 0xfff00000)
+	add	r3, r8, r3			@ phys of the kernel's first section
 
 	/* For XIP, kernel_sec_start/kernel_sec_end are currently in RO memory */
 #ifndef CONFIG_XIP_KERNEL
 	adr_l	r5, kernel_sec_start		@ _pa(kernel_sec_start)
 #if defined CONFIG_CPU_ENDIAN_BE8 || defined CONFIG_CPU_ENDIAN_BE32
-	str	r8, [r5, #4]			@ Save physical start of kernel (BE)
+	str	r3, [r5, #4]			@ Save physical start of kernel (BE)
 #else
-	str	r8, [r5]			@ Save physical start of kernel (LE)
+	str	r3, [r5]			@ Save physical start of kernel (LE)
 #endif
 #endif
-	orr	r3, r8, r7			@ Add the MMU flags
+	orr	r3, r3, r7			@ Add the MMU flags
 	add	r6, r4, r6, lsr #(SECTION_SHIFT - PMD_ENTRY_ORDER)
 1:	str	r3, [r0], #1 << PMD_ENTRY_ORDER
 	add	r3, r3, #1 << SECTION_SHIFT

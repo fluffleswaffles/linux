@@ -673,6 +673,13 @@ config CHARGER_PM8916_LBC
 	  To compile this driver as module, choose M here: the
 	  module will be called pm8916_lbc.
 
+config BATTERY_RAPUYAMA
+	tristate "Nokia RapuYama (E6) battery"
+	depends on RAPUYAMA_WATCHDOG
+	help
+	  Battery voltage, temperature and charger presence from the gazoo
+	  pmic adc of the Nokia E6.
+
 config CHARGER_BQ2415X
 	tristate "TI BQ2415x battery charger driver"
 	depends on I2C

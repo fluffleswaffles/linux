@@ -135,6 +135,7 @@ static struct usb_configuration serial_config_driver = {
 	/* .bConfigurationValue = f(use_acm) */
 	/* .iConfiguration = DYNAMIC */
 	.bmAttributes	= USB_CONFIG_ATT_SELFPOWER,
+	.MaxPower	= CONFIG_USB_GADGET_VBUS_DRAW,
 };
 
 static struct usb_function_instance *fi_serial[MAX_U_SERIAL_PORTS];

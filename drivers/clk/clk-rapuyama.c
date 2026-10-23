@@ -103,7 +103,10 @@ static const struct ry_res_desc ry_res[] = {
 	{ 0x0c, { 0x10 } },			/* EHwClkCamera */
 	{ 0x11, { 0x07, 0x12 }, true },		/* EHwClkI2C1, i2c0.dll */
 	{ 0x12, { 0x08, 0x13 } },		/* EHwClkI2C2 */
-	{ 0x13, { 0x09, 0x14 } },		/* EHwClkIrDA1M */
+	/* EHwClkIrDA1M by name, but these two gates are what isasw switches
+	 * on for its hs i2c port 3 (the charger, 0x20032500), i2c-omap doesn't
+	 * enable clocks itself */
+	{ 0x13, { 0x09, 0x14 } },
 	{ 0x14, { 0x0a, 0x03 } },		/* EHwClkIrDA4M */
 	{ 0x15, { 0x0b } },			/* EHwClkLoSSI */
 	{ 0x16, { 0x04 } },			/* EHwClkMeSSI */

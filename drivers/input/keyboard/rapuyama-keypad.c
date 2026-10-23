@@ -24,11 +24,14 @@
 #define RK_FIFO_EMPTY	0x7f
 #define RK_FIFO_DEPTH	16
 #define RK_POLL_MS	20
+#define RK_IDLE_MS	40	/* no key for RK_FAST_POLLS polls */
+#define RK_FAST_POLLS	25
 
 struct rapuyama_keypad {
 	struct i2c_client *client;
 	struct input_dev *input;
 	unsigned int rows, cols, row_shift;
+	unsigned int fast;	/* polls left at RK_POLL_MS */
 };
 
 /* returns how many events were in the FIFO */
@@ -57,9 +60,16 @@ static int rapuyama_keypad_drain(struct rapuyama_keypad *kp, bool report)
 	return i;
 }
 
+/* every poll is i2c traffic + an irq per byte: slow down while nothing happens */
 static void rapuyama_keypad_poll(struct input_dev *input)
 {
-	rapuyama_keypad_drain(input_get_drvdata(input), true);
+	struct rapuyama_keypad *kp = input_get_drvdata(input);
+
+	if (rapuyama_keypad_drain(kp, true))
+		kp->fast = RK_FAST_POLLS;
+	else if (kp->fast)
+		kp->fast--;
+	input_set_poll_interval(input, kp->fast ? RK_POLL_MS : RK_IDLE_MS);
 }
 
 static int rapuyama_keypad_probe(struct i2c_client *client)
@@ -117,8 +127,8 @@ static int rapuyama_keypad_probe(struct i2c_client *client)
 	ret = input_register_device(kp->input);
 	if (ret)
 		return ret;
-	dev_info(dev, "%ux%u matrix, polled every %d ms\n",
-		 kp->rows, kp->cols, RK_POLL_MS);
+	dev_info(dev, "%ux%u matrix, polled every %d ms (%d ms idle)\n",
+		 kp->rows, kp->cols, RK_POLL_MS, RK_IDLE_MS);
 	return 0;
 }
 

@@ -494,6 +494,10 @@ EXPORT_SYMBOL_GPL(power_supply_put);
 #ifdef CONFIG_OF
 static int power_supply_match_device_node(struct device *dev, const void *data)
 {
+	struct power_supply *psy = dev_get_drvdata(dev);
+
+	if (psy->of_node)
+		return psy->of_node == data;
 	return dev->parent && dev->parent->of_node == data;
 }
 

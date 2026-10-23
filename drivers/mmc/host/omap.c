@@ -800,7 +800,7 @@ static irqreturn_t mmc_omap_irq(int irq, void *dev_id)
 					host->current_slot;
 				if (slot == NULL ||
 				    !mmc_omap_cover_is_open(slot))
-					dev_err(mmc_dev(host->mmc),
+					dev_dbg(mmc_dev(host->mmc),
 						"command timeout (CMD%d)\n",
 						cmd);
 				host->cmd->error = -ETIMEDOUT;

@@ -159,6 +159,9 @@ struct bq2415x_device {
 	struct device *dev;
 	struct bq2415x_platform_data init_data;
 	struct power_supply *charger;
+	struct power_supply *battery;
+	struct power_supply *source;
+	bool notifier_registered;
 	struct power_supply_desc charger_desc;
 	struct delayed_work work;
 	struct device_node *notify_node;
@@ -210,6 +213,8 @@ static int bq2415x_i2c_read(struct bq2415x_device *bq, u8 reg)
 	if (ret < 0)
 		return ret;
 
+	if (ret != ARRAY_SIZE(msg))
+		return -EIO;
 	return val;
 }
 
@@ -695,12 +700,43 @@ static int bq2415x_get_termination_current(struct bq2415x_device *bq)
 			return ret; \
 	} while (0)
 
+/* monitored-battery boards: no charge with missing adc data or outside 5..40 C */
+static bool bq2415x_battery_allows_charge(struct bq2415x_device *bq)
+{
+	union power_supply_propval temp, voltage, budget;
+	int low = 50, high = 400;
+
+	if (!bq->battery)
+		return true;
+	if (!bq->source || power_supply_get_property(bq->source,
+			POWER_SUPPLY_PROP_CURRENT_MAX, &budget) || budget.intval < 500000)
+		return false;
+	if (power_supply_get_property(bq->battery, POWER_SUPPLY_PROP_TEMP, &temp) ||
+	    power_supply_get_property(bq->battery, POWER_SUPPLY_PROP_VOLTAGE_NOW, &voltage))
+		return false;
+	/* two degrees of hysteresis before starting again */
+	if (bq->mode == BQ2415X_MODE_OFF) {
+		low += 20;
+		high -= 20;
+	}
+	return temp.intval >= low && temp.intval <= high &&
+	       voltage.intval >= 2500000 && voltage.intval <= 4250000;
+}
+
 /* set default values of all properties */
 static int bq2415x_set_defaults(struct bq2415x_device *bq)
 {
-	bq2415x_exec_command(bq, BQ2415X_BOOST_MODE_DISABLE);
-	bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
-	bq2415x_exec_command(bq, BQ2415X_CHARGE_TERMINATION_DISABLE);
+	int ret;
+
+	ret = bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
+	if (ret < 0)
+		return ret;
+	ret = bq2415x_exec_command(bq, BQ2415X_BOOST_MODE_DISABLE);
+	if (ret < 0)
+		return ret;
+	ret = bq2415x_exec_command(bq, BQ2415X_CHARGE_TERMINATION_DISABLE);
+	if (ret < 0)
+		return ret;
 
 	bq2415x_set_default_value(bq, current_limit);
 	bq2415x_set_default_value(bq, weak_battery_voltage);
@@ -709,11 +745,14 @@ static int bq2415x_set_defaults(struct bq2415x_device *bq)
 	if (bq->init_data.resistor_sense > 0) {
 		bq2415x_set_default_value(bq, charge_current);
 		bq2415x_set_default_value(bq, termination_current);
-		bq2415x_exec_command(bq, BQ2415X_CHARGE_TERMINATION_ENABLE);
+		ret = bq2415x_exec_command(bq, BQ2415X_CHARGE_TERMINATION_ENABLE);
+		if (ret < 0)
+			return ret;
 	}
 
-	bq2415x_exec_command(bq, BQ2415X_CHARGER_ENABLE);
-	return 0;
+	if (bq->battery)
+		return bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
+	return bq2415x_exec_command(bq, BQ2415X_CHARGER_ENABLE);
 }
 
 /**** charger mode functions ****/
@@ -725,6 +764,15 @@ static int bq2415x_set_mode(struct bq2415x_device *bq, enum bq2415x_mode mode)
 	int charger = 0;
 	int boost = 0;
 
+	if (bq->battery) {
+		if (mode == BQ2415X_MODE_BOOST)
+			return -EPERM;
+		if (mode != BQ2415X_MODE_OFF && !bq2415x_battery_allows_charge(bq))
+			mode = BQ2415X_MODE_OFF;
+		/* this board has no dedicated-charger detection */
+		if (mode == BQ2415X_MODE_DEDICATED_CHARGER)
+			mode = BQ2415X_MODE_HOST_CHARGER;
+	}
 	if (mode == BQ2415X_MODE_BOOST)
 		boost = 1;
 	else if (mode != BQ2415X_MODE_OFF)
@@ -732,6 +780,8 @@ static int bq2415x_set_mode(struct bq2415x_device *bq, enum bq2415x_mode mode)
 
 	if (!charger)
 		ret = bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
+	if (ret < 0)
+		return ret;
 
 	if (!boost)
 		ret = bq2415x_exec_command(bq, BQ2415X_BOOST_MODE_DISABLE);
@@ -817,8 +867,8 @@ static int bq2415x_notifier_call(struct notifier_block *nb,
 
 	/* Ignore event if it was not send by notify_node/notify_device */
 	if (bq->notify_node) {
-		if (!psy->dev.parent ||
-		    psy->dev.parent->of_node != bq->notify_node)
+		if (psy->of_node ? psy->of_node != bq->notify_node :
+		    (!psy->dev.parent || psy->dev.parent->of_node != bq->notify_node))
 			return NOTIFY_OK;
 	} else if (bq->init_data.notify_device) {
 		if (strcmp(psy->desc->name, bq->init_data.notify_device) != 0)
@@ -829,10 +879,14 @@ static int bq2415x_notifier_call(struct notifier_block *nb,
 
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_MAX,
 			&prop);
+	if (bq->battery) {
+		mod_delayed_work(system_wq, &bq->work, 0);
+		return NOTIFY_OK;
+	}
 	if (ret != 0)
 		return NOTIFY_OK;
 
-	if (!bq2415x_update_reported_mode(bq, prop.intval))
+	if (!bq2415x_update_reported_mode(bq, prop.intval / 1000))
 		return NOTIFY_OK;
 
 	/* if automode is not enabled do not tell about reported_mode */
@@ -853,13 +907,15 @@ static void bq2415x_set_autotimer(struct bq2415x_device *bq, int state)
 
 	if (bq->autotimer == state) {
 		mutex_unlock(&bq2415x_timer_mutex);
+		if (!state)
+			cancel_delayed_work_sync(&bq->work);
 		return;
 	}
 
 	bq->autotimer = state;
 
 	if (state) {
-		schedule_delayed_work(&bq->work, BQ2415X_TIMER_TIMEOUT * HZ);
+		schedule_delayed_work(&bq->work, bq->battery ? 0 : BQ2415X_TIMER_TIMEOUT * HZ);
 		bq2415x_exec_command(bq, BQ2415X_TIMER_RESET);
 		bq->timer_error = NULL;
 	} else {
@@ -878,7 +934,8 @@ static void bq2415x_timer_error(struct bq2415x_device *bq, const char *msg)
 	if (bq->automode > 0)
 		bq->automode = 0;
 	bq2415x_set_mode(bq, BQ2415X_MODE_OFF);
-	bq2415x_set_autotimer(bq, 0);
+	/* this is the timer work itself; it returns without rearming */
+	WRITE_ONCE(bq->autotimer, 0);
 }
 
 /* delayed work function for auto resetting chip timer */
@@ -890,7 +947,19 @@ static void bq2415x_timer_work(struct work_struct *work)
 	int error;
 	int boost;
 
-	if (bq->automode > 0 && (bq->reported_mode != bq->mode)) {
+	if (!READ_ONCE(bq->autotimer))
+		return;
+	if (bq->battery) {
+		enum bq2415x_mode mode = bq2415x_battery_allows_charge(bq) ?
+			BQ2415X_MODE_HOST_CHARGER : BQ2415X_MODE_OFF;
+
+		/* re-evaluate live adc data before feeding the 32 s watchdog */
+		ret = bq2415x_set_mode(bq, mode);
+		if (ret < 0) {
+			bq2415x_timer_error(bq, "Battery policy update failed");
+			return;
+		}
+	} else if (bq->automode > 0 && (bq->reported_mode != bq->mode)) {
 		sysfs_notify(&bq->charger->dev.kobj, NULL, "reported_mode");
 		bq2415x_set_mode(bq, bq->reported_mode);
 	}
@@ -1087,6 +1156,9 @@ static ssize_t bq2415x_sysfs_set_timer(struct device *dev,
 	struct bq2415x_device *bq = power_supply_get_drvdata(psy);
 	int ret = 0;
 
+	if (bq->battery)
+		return -EPERM;
+
 	if (strncmp(buf, "auto", 4) == 0)
 		bq2415x_set_autotimer(bq, 1);
 	else if (strncmp(buf, "off", 3) == 0)
@@ -1132,6 +1204,9 @@ static ssize_t bq2415x_sysfs_set_mode(struct device *dev,
 	struct bq2415x_device *bq = power_supply_get_drvdata(psy);
 	enum bq2415x_mode mode;
 	int ret = 0;
+
+	if (bq->battery)
+		return -EPERM;
 
 	if (strncmp(buf, "auto", 4) == 0) {
 		if (bq->automode < 0)
@@ -1251,6 +1326,9 @@ static ssize_t bq2415x_sysfs_set_registers(struct device *dev,
 	unsigned int reg;
 	unsigned int val;
 
+	if (bq->battery)
+		return -EPERM;
+
 	if (sscanf(buf, "%x %x", &reg, &val) != 2)
 		return -EINVAL;
 
@@ -1302,6 +1380,9 @@ static ssize_t bq2415x_sysfs_set_limit(struct device *dev,
 	struct bq2415x_device *bq = power_supply_get_drvdata(psy);
 	long val;
 	int ret;
+
+	if (bq->battery)
+		return -EPERM;
 
 	if (kstrtol(buf, 10, &val) < 0)
 		return -EINVAL;
@@ -1362,6 +1443,9 @@ static ssize_t bq2415x_sysfs_set_enable(struct device *dev,
 	enum bq2415x_command command;
 	long val;
 	int ret;
+
+	if (bq->battery)
+		return -EPERM;
 
 	if (kstrtol(buf, 10, &val) < 0)
 		return -EINVAL;
@@ -1589,6 +1673,7 @@ static int bq2415x_probe(struct i2c_client *client)
 	else if (ACPI_HANDLE(bq->dev))
 		bq->chip = acpi_id->driver_data;
 	bq->name = name;
+	INIT_DELAYED_WORK(&bq->work, bq2415x_timer_work);
 	bq->mode = BQ2415X_MODE_OFF;
 	bq->reported_mode = BQ2415X_MODE_OFF;
 	bq->autotimer = 0;
@@ -1632,7 +1717,26 @@ static int bq2415x_probe(struct i2c_client *client)
 		memcpy(&bq->init_data, pdata, sizeof(bq->init_data));
 	}
 
-	bq2415x_reset_chip(bq);
+	if (device_property_present(bq->dev, "monitored-battery")) {
+		bq->battery = devm_power_supply_get_by_phandle(bq->dev, "monitored-battery");
+		if (IS_ERR_OR_NULL(bq->battery)) {
+			ret = bq->battery ? PTR_ERR(bq->battery) : -EPROBE_DEFER;
+			goto error_2;
+		}
+		bq->source = devm_power_supply_get_by_phandle(bq->dev, "ti,usb-charger-detection");
+		if (IS_ERR_OR_NULL(bq->source)) {
+			ret = bq->source ? PTR_ERR(bq->source) : -EPROBE_DEFER;
+			goto error_2;
+		}
+	}
+	/* don't program a missing chip after a failed identification read */
+	ret = bq2415x_i2c_read(bq, BQ2415X_REG_VENDER);
+	if (ret < 0) {
+		dev_err_probe(bq->dev, ret, "cannot read charger identity\n");
+		goto error_2;
+	}
+	if (!bq->battery)
+		bq2415x_reset_chip(bq);
 
 	ret = bq2415x_power_supply_init(bq);
 	if (ret) {
@@ -1654,6 +1758,7 @@ static int bq2415x_probe(struct i2c_client *client)
 			goto error_3;
 		}
 
+		bq->notifier_registered = true;
 		bq->automode = 1;
 		dev_info(bq->dev, "automode supported, waiting for events\n");
 	} else {
@@ -1679,18 +1784,26 @@ static int bq2415x_probe(struct i2c_client *client)
 		power_supply_put(notify_psy);
 
 		if (ret == 0) {
-			bq2415x_update_reported_mode(bq, prop.intval);
+			bq2415x_update_reported_mode(bq, prop.intval / 1000);
 			bq2415x_set_mode(bq, bq->reported_mode);
 		}
 	}
 
-	INIT_DELAYED_WORK(&bq->work, bq2415x_timer_work);
+	if (bq->battery) {
+		ret = bq2415x_set_mode(bq, BQ2415X_MODE_HOST_CHARGER);
+		if (ret < 0)
+			goto error_3;
+	}
 	bq2415x_set_autotimer(bq, 1);
 
 	dev_info(bq->dev, "driver registered\n");
 	return 0;
 
 error_3:
+	if (bq->notifier_registered)
+		power_supply_unreg_notifier(&bq->nb);
+	if (bq->battery)
+		bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
 	bq2415x_power_supply_exit(bq);
 error_2:
 	if (bq)
@@ -1710,13 +1823,16 @@ static void bq2415x_remove(struct i2c_client *client)
 {
 	struct bq2415x_device *bq = i2c_get_clientdata(client);
 
-	if (bq->nb.notifier_call)
+	if (bq->notifier_registered)
 		power_supply_unreg_notifier(&bq->nb);
 
 	of_node_put(bq->notify_node);
 	bq2415x_power_supply_exit(bq);
 
-	bq2415x_reset_chip(bq);
+	if (bq->battery)
+		bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
+	else
+		bq2415x_reset_chip(bq);
 
 	mutex_lock(&bq2415x_id_mutex);
 	idr_remove(&bq2415x_id, bq->id);
@@ -1725,6 +1841,16 @@ static void bq2415x_remove(struct i2c_client *client)
 	dev_info(bq->dev, "driver unregistered\n");
 
 	kfree(bq->name);
+}
+
+static void bq2415x_shutdown(struct i2c_client *client)
+{
+	struct bq2415x_device *bq = i2c_get_clientdata(client);
+
+	if (bq->battery) {
+		bq2415x_set_autotimer(bq, 0);
+		bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
+	}
 }
 
 static const struct i2c_device_id bq2415x_i2c_id_table[] = {
@@ -1792,6 +1918,7 @@ static struct i2c_driver bq2415x_driver = {
 	},
 	.probe = bq2415x_probe,
 	.remove = bq2415x_remove,
+	.shutdown = bq2415x_shutdown,
 	.id_table = bq2415x_i2c_id_table,
 };
 module_i2c_driver(bq2415x_driver);

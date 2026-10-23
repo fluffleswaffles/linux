@@ -114,7 +114,8 @@
  * FUN_8032a154 (init), FUN_80329c8c (self test), FUN_80329ec8 (one piece),
  * FUN_8032a020 (irq: status +0x18, write the bits back to ack)
  */
-#define G_CTRL	0x10	/* 2 = reset, 0x2015 = run */
+#define G_CTRL	0x10	/* sysconfig: reset, idle and standby policy */
+#define G_IDLE		0x2015	/* firmware idle and standby policy */
 #define G_STAT	0x14	/* bit 0: reset busy */
 #define G_IRQ	0x18	/* bit 0: piece done, write back to ack */
 #define G_1C	0x1c
@@ -126,6 +127,7 @@
 #define G_64	0x64
 #define G_MODE	0x68	/* 0x700000 = self test */
 #define G_6C	0x6c
+#define G_DIV	0x70	/* logic divider 1, pixel divider >= 2 */
 #define G_SIZE	0x7c	/* (w - 1) << 16 | (h - 1), w in halfwords */
 #define G_ADDR	0x80	/* source phys */
 #define G_88	0x88
@@ -178,7 +180,7 @@ static bool matrix;
 module_param(matrix, bool, 0444);
 MODULE_PARM_DESC(matrix, "send an identity colour matrix instead of Symbian's all zero one");
 
-static bool test_pattern = true;
+static bool test_pattern;
 module_param(test_pattern, bool, 0444);
 MODULE_PARM_DESC(test_pattern, "show colour bars for 3 s once the display is up");
 
@@ -233,7 +235,7 @@ struct vc {
 	struct clk *clk;
 
 	/* gfx dma (videocore.dma=1): push is then physically contiguous */
-	void __iomem *gfx, *pll, *gdiv;
+	void __iomem *gfx, *pll, *gdiv, *pads;
 	bool gfx_ok;	/* init passed */
 	int dma_log;	/* log the steps of the first dma piece */
 	bool dma_ok;	/* frames go by dma (after the PIO bring-up) */
@@ -250,7 +252,7 @@ struct vc {
 
 	/* VCHI */
 	u8 rx[0x1100];
-	u8 tx[VCHI_SLOT] __aligned(64);	/* gfx dma reads it */
+	u8 *tx;		/* VCHI_SLOT bytes, gfx dma reads it */
 	u8 bulk_msg[VCHI_MAX_MSG];
 	u32 tx_cur;
 	u32 credits_owed; /* rx slots we freed, returned in the next tx */
@@ -284,6 +286,7 @@ struct vc {
 
 	u32 pitch;	/* VC_W * 2 or 4 */
 	bool push_ready;	/* push already holds the frame (test pattern) */
+	bool push_low;		/* push is the low buffer from lowmem.c */
 	unsigned int partial_log;
 	u8 row[VC_W * 4];	/* one converted row for the diff */
 
@@ -437,15 +440,9 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 		writel(0, vc->gfx + G_6C);
 		writel(0x8908, vc->gfx + G_GO);
 		writel(0x8908 | 0x20, vc->gfx + G_GO);
-		if (vc->dma_log)
-			dev_info(vc->dev, "dma 1st piece: go\n");
 		writel(0x8908 | 0x21, vc->gfx + G_GO);
-		if (vc->dma_log)
-			dev_info(vc->dev, "dma 1st piece: vc count + enable\n");
 		vc_wr(vc, VC_DMACNT, lines * G_W);
 		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) | 0x11);
-		if (vc->dma_log)
-			dev_info(vc->dev, "dma 1st piece: wait\n");
 		/* no sleep: it would be a whole jiffy (periodic timer) */
 		ret = readl_poll_timeout_atomic(vc->gfx + G_IRQ, st, st & 1, 1,
 						100000);
@@ -454,13 +451,14 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 				 ret ? "timeout" : "done", st);
 			vc->dma_log = 0;
 		}
-		writel(readl(vc->gfx + G_IRQ) & 0x1ffff, vc->gfx + G_IRQ);
+		/* a stalled engine may also stall reads of its other registers */
+		writel(st & 0x1ffff, vc->gfx + G_IRQ);
 		if (!ret)
 			ret = vc_idle(vc);
 		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) & ~0x11);
 		if (ret) {
-			dev_err(vc->dev, "gfx dma piece timed out, PIO from now on\n");
 			vc->dma_ok = false;
+			dev_err(vc->dev, "gfx dma piece timed out, PIO from now on\n");
 			return ret;
 		}
 	}
@@ -489,7 +487,8 @@ static int vc_gfx_init(struct vc *vc)
 	dev_info(vc->dev, "gfx dma init: pll %08x = %u kHz, divider %u\n", r, f, d);
 	writel((readl(vc->gdiv) & ~0x30) | ((d - 1) & 3) << 4, vc->gdiv);
 
-	dev_info(vc->dev, "gfx dma init: reset\n");
+	dev_info(vc->dev, "gfx dma init: reset, inherited divisor %08x\n",
+		 readl(vc->gfx + G_DIV));
 	writel(2, vc->gfx + G_CTRL);
 	ret = readl_poll_timeout(vc->gfx + G_STAT, st, !(st & 1), 10, 10000);
 	writel(0, vc->gfx + G_CTRL);
@@ -497,12 +496,15 @@ static int vc_gfx_init(struct vc *vc)
 		return ret;
 
 	dev_info(vc->dev, "gfx dma init: regs\n");
-	writel(0x2015, vc->gfx + G_CTRL);
+	/* FUN_8032a154 idle policy; forcing noidle did not fix the timeout */
+	writel(G_IDLE, vc->gfx + G_CTRL);
 	writel(0x4005, vc->gfx + G_44);
 	writel(0x18108, vc->gfx + G_GO);
 	writel(0x200000, vc->gfx + G_64);
 	writel(0x900000, vc->gfx + G_MODE);
 	writel(0x4000, vc->gfx + G_6C);
+	/* FUN_8032a6b4: max(2, gfx kHz / (1e9 / access ps)), 14 or 17 ns */
+	writel(0x10002, vc->gfx + G_DIV);
 	writel(0, vc->gfx + G_88);
 	writel(0x7ff, vc->gfx + G_60);
 	writel(0xffffffff, vc->gfx + G_IRQ);
@@ -517,8 +519,16 @@ static int vc_gfx_init(struct vc *vc)
 	writel(0x8d, vc->gfx + 0xa0);
 	writel(vc->push_phys, vc->gfx + G_ADDR);
 
-	/* no self test: the test mode run killed the phone */
-	dev_info(vc->dev, "gfx dma: pll %u kHz, div %u, init done\n", f, d);
+	/*
+	 * no self test: the test mode run killed the phone. but it ends with
+	 * mode 0 (FUN_80329c8c: +0x68 = 0, +0x18 = ~0, +0x1c = 0x5641), and
+	 * that is what every Symbian piece runs in, not the 0x900000 above
+	 */
+	writel(0, vc->gfx + G_MODE);
+	writel(0xffffffff, vc->gfx + G_IRQ);
+	writel(0x5641, vc->gfx + G_1C);
+	dev_info(vc->dev, "gfx dma: pll %u kHz, div %u, pixel div %08x, fifo %u, sysconfig %04x, init done\n",
+		 f, d, readl(vc->gfx + G_DIV), t, G_IDLE);
 	vc->dma_log = 1;
 	return ret;
 }
@@ -531,24 +541,45 @@ static void vc_timings(struct vc *vc, bool boot)
 	vc_wr(vc, VC_TIM1, boot ? VC_TIM_BOOT1 : VC_TIM_NORM1);
 }
 
-/* FUN_8032fb08 + FUN_8032a368, only if nobody (Symbian) left it set up */
+static void vc_pads_init(struct vc *vc)
+{
+	u32 old[3];
+	unsigned int i;
+	static const u32 mask[] = { 0x77777700, 0x77777777, 0x07770077 };
+	static const u32 value[] = { 0x44444400, 0x44444444, 0x04440044 };
+
+	/* FUN_80329a10: small dma and PIO share function 4 */
+	for (i = 0; i < ARRAY_SIZE(mask); i++) {
+		old[i] = readl(vc->pads + i * 0x10);
+		writel((old[i] & ~mask[i]) | value[i], vc->pads + i * 0x10);
+	}
+	dev_info(vc->dev, "host pads: %08x %08x %08x -> function 4\n",
+		 old[0], old[1], old[2]);
+}
+
+/*
+ * FUN_8032fb08 + FUN_8032a368, always: whatever Symbian left (it may have
+ * been in the middle of something, or idle with its dma side off) must not
+ * decide how our bus and dma run
+ */
 static int vc_bus_init(struct vc *vc)
 {
 	unsigned int i;
 
-	if (vc_rd(vc, VC_MODE) != VC_MODE_DATA) {
-		vc_wr(vc, VC_CTRL, 0x0a);
-		for (i = 0; i < 1000000 && (vc_rd(vc, VC_STAT) & 1); i++)
-			cpu_relax();
-		vc_wr(vc, VC_CTRL, 0x11);
-		vc_wr(vc, VC_MODE, VC_MODE_DATA);
-		vc_wr(vc, VC_6C, 0x10);
-		vc_wr(vc, VC_90, 0x6d60);
-		vc_wr(vc, VC_DMACTL, 0x64);
-		if (vc_idle(vc))
-			return -EIO;
-		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) & ~0x11);
-	}
+	dev_info(vc->dev, "bus left by symbian: mode %08x dmactl %08x 6c %08x 90 %08x tim %08x %08x\n",
+		 vc_rd(vc, VC_MODE), vc_rd(vc, VC_DMACTL), vc_rd(vc, VC_6C),
+		 vc_rd(vc, VC_90), vc_rd(vc, VC_TIM0), vc_rd(vc, VC_TIM1));
+	vc_wr(vc, VC_CTRL, 0x0a);
+	for (i = 0; i < 1000000 && (vc_rd(vc, VC_STAT) & 1); i++)
+		cpu_relax();
+	vc_wr(vc, VC_CTRL, 0x11);
+	vc_wr(vc, VC_MODE, VC_MODE_DATA);
+	vc_wr(vc, VC_6C, 0x10);
+	vc_wr(vc, VC_90, 0x6d60);
+	vc_wr(vc, VC_DMACTL, 0x64);
+	if (vc_idle(vc))
+		return -EIO;
+	vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) & ~0x11);
 	return vc_chan(vc, 0);
 }
 
@@ -692,14 +723,14 @@ static int vc_boot(struct vc *vc)
 	u32 type, value;
 	int ret;
 
+	/* VC in reset first, like Symbian's cold start: bus and dma init under it */
+	gpiod_set_value_cansleep(vc->run, 0);
+	vc_pads_init(vc);
 	ret = vc_bus_init(vc);
 	if (ret)
 		return ret;
-	/* gfx dma init where Symbian does it: after the bus init, VC in reset */
-	if (dma) {
-		gpiod_set_value_cansleep(vc->run, 0);
+	if (dma)
 		vc->gfx_ok = !vc_gfx_init(vc);
-	}
 	vc_timings(vc, true);
 	vc->rx_armed = false;
 	vc->last_status = 0;
@@ -806,7 +837,9 @@ static int vchi_slot_send(struct vc *vc)
 		if (!dma_mapping_error(vc->dev, a)) {
 			ret = vc_tx_dma(vc, vc->tx, a, VCHI_SLOT, 0);
 			dma_unmap_single(vc->dev, a, VCHI_SLOT, DMA_TO_DEVICE);
-			return ret;
+			/* a timed out slot goes again by PIO, the message must arrive */
+			if (!ret)
+				return 0;
 		}
 	}
 	return vc_tx(vc, vc->tx, VCHI_SLOT, 0);
@@ -2592,6 +2625,19 @@ static const struct file_operations vc_khrn_fops = {
 
 /* ---- platform ---- */
 
+/* low ram right after the kernel (mach-rapuyama/lowmem.c), the gfx dma
+ * doesn't read high ram */
+extern phys_addr_t rapuyama_vc_push, rapuyama_vc_tx;
+
+static void vc_push_release(struct vc *vc)
+{
+	/* the low buffer is reserved ram for good, nothing to give back */
+	if (!vc->push_low)
+		free_pages_exact(vc->push, VC_FB_SIZE);
+	vc->push = NULL;
+	vc->push_low = false;
+}
+
 static void vc_push_free(struct vc *vc)
 {
 	if (!dma) {
@@ -2599,19 +2645,24 @@ static void vc_push_free(struct vc *vc)
 		return;
 	}
 	dma_unmap_single(vc->dev, vc->push_phys, VC_FB_SIZE, DMA_TO_DEVICE);
-	free_pages_exact(vc->push, VC_FB_SIZE);
+	vc_push_release(vc);
 }
 
 static int rapuyama_videocore_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct vc *vc;
+	struct resource *res;
 	int ret;
 
 	vc = devm_drm_dev_alloc(dev, &vc_drm_driver, struct vc, drm);
 	if (IS_ERR(vc))
 		return PTR_ERR(vc);
 	vc->dev = dev;
+	vc->tx = rapuyama_vc_tx ? phys_to_virt(rapuyama_vc_tx) :
+		 devm_kzalloc(dev, VCHI_SLOT, GFP_KERNEL);
+	if (!vc->tx)
+		return -ENOMEM;
 	vc->dspc_token = 0x100;
 	init_waitqueue_head(&vc->wq);
 	spin_lock_init(&vc->band_lock);
@@ -2624,6 +2675,13 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 	vc->bus = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(vc->bus))
 		return PTR_ERR(vc->bus);
+	/* the last mux word is also in the GPIO mapping */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 4);
+	if (!res)
+		return -EINVAL;
+	vc->pads = devm_ioremap(dev, res->start, resource_size(res));
+	if (!vc->pads)
+		return -ENOMEM;
 	vc->clk = devm_clk_get_optional_enabled(dev, NULL);
 	if (IS_ERR(vc->clk))
 		return dev_err_probe(dev, PTR_ERR(vc->clk), "no ViSSI clock\n");
@@ -2647,18 +2705,31 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 		}
 	}
 	if (dma) {
-		vc->push = alloc_pages_exact(VC_FB_SIZE, GFP_KERNEL | __GFP_ZERO);
+		/* reserved, still in the linear map: dma_map_single takes it */
+		if (rapuyama_vc_push) {
+			vc->push = phys_to_virt(rapuyama_vc_push);
+			vc->push_low = true;
+			memset(vc->push, 0, VC_FB_SIZE);
+		}
+		if (!vc->push)
+			vc->push = alloc_pages_exact(VC_FB_SIZE,
+						     GFP_KERNEL | __GFP_ZERO);
 		if (vc->push) {
 			vc->push_phys = dma_map_single(dev, vc->push, VC_FB_SIZE,
 						       DMA_TO_DEVICE);
-			if (dma_mapping_error(dev, vc->push_phys)) {
-				free_pages_exact(vc->push, VC_FB_SIZE);
-				vc->push = NULL;
-			}
+			if (dma_mapping_error(dev, vc->push_phys))
+				vc_push_release(vc);
 		}
 		if (!vc->push) {
 			dev_warn(dev, "no contiguous push buffer, PIO\n");
 			dma = false;
+		}
+		if (vc->push) {
+			phys_addr_t tx = virt_to_phys(vc->tx);
+
+			dev_info(dev, "gfx dma: push %pad%s, tx slot %pa\n",
+				 &vc->push_phys, vc->push_low ? " (low)" : "",
+				 &tx);
 		}
 	}
 	if (!dma)

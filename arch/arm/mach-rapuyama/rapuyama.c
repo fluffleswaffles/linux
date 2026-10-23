@@ -37,6 +37,8 @@
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
 
+#include "lowmem.h"
+
 #define RY_BUS_PHYS	0x20000000
 #define RY_BUS_VIRT	0xf8000000
 #define RY_BUS(off)	((void __iomem *)(RY_BUS_VIRT + (off)))
@@ -130,6 +132,7 @@ static void __init rapuyama_init_early(void)
 {
 	hook_fault_code(8, rapuyama_ext_abort, SIGBUS, 0,
 			"external abort on non-linefetch");
+	rapuyama_lowmem_init_early();
 }
 
 static int __init rapuyama_stop_param(char *s)
@@ -599,7 +602,8 @@ void rapuyama_early_wdt_stop(void)
  * reserves them (still mapped, see e6.dts). every 2 s each 4 KB page gets a checksum, a page that
  * changed since the last pass goes to the log with its first words. nothing
  * here = nobody writes there and the random deaths are something else.
- * e6.shmwatch=0 turns it off
+ * the scan is off by default (e6.shmwatch=1), the debugfs files are always
+ * there (tools/dram_dump.py)
  */
 static const struct {
 	phys_addr_t base;
@@ -613,7 +617,7 @@ static const struct {
 #define RY_SHM_PERIOD (2 * HZ)
 #define RY_SHM_MAXLOG 8	/* changed pages logged per pass */
 
-static bool rapuyama_shm_on = true;
+static bool rapuyama_shm_on;
 static u32 *rapuyama_shm_virt[ARRAY_SIZE(rapuyama_shm)];
 static u32 *rapuyama_shm_sum[ARRAY_SIZE(rapuyama_shm)];
 static struct debugfs_blob_wrapper rapuyama_shm_blob[ARRAY_SIZE(rapuyama_shm)];
@@ -696,7 +700,7 @@ static int __init rapuyama_shm_init(void)
 	struct dentry *dir;
 	unsigned int r;
 
-	if (!rapuyama_shm_on || !of_machine_is_compatible("nokia,rapuyama"))
+	if (!of_machine_is_compatible("nokia,rapuyama"))
 		return 0;
 	dir = debugfs_create_dir("rapuyama-shm", NULL);
 	for (r = 0; r < ARRAY_SIZE(rapuyama_shm); r++) {
@@ -724,6 +728,8 @@ static int __init rapuyama_shm_init(void)
 					    &rapuyama_shm_fops);
 		}
 	}
+	if (!rapuyama_shm_on)
+		return 0;
 	INIT_DELAYED_WORK(&rapuyama_shm_work, rapuyama_shm_scan);
 	schedule_delayed_work(&rapuyama_shm_work, 0);
 	return 0;
@@ -828,5 +834,6 @@ static const char *const rapuyama_dt_compat[] __initconst = {
 DT_MACHINE_START(RAPUYAMA, "Nokia RapuYama")
 	.dt_compat	= rapuyama_dt_compat,
 	.map_io		= rapuyama_map_io,
+	.reserve	= rapuyama_lowmem_reserve,
 	.init_early	= rapuyama_init_early,
 MACHINE_END

@@ -1527,7 +1527,7 @@ static void __init map_lowmem(void)
 
 		/* Case 5: kernel covers range, don't map anything, should be rare */
 		if ((start > kernel_sec_start) && (end < kernel_sec_end))
-			break;
+			continue;
 
 		/* Cases where the kernel is starting inside the range */
 		if ((kernel_sec_start >= start) && (kernel_sec_start <= end)) {
@@ -1545,7 +1545,8 @@ static void __init map_lowmem(void)
 				map.length = end - kernel_sec_end;
 				map.type = MT_MEMORY_RW;
 				create_mapping(&map);
-				break;
+				/* not break: banks above this one still need mapping */
+				continue;
 			}
 			/* Case 1: kernel and range start at the same address, should be common */
 			if (kernel_sec_start == start)

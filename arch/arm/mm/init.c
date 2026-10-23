@@ -146,6 +146,11 @@ int pfn_valid(unsigned long pfn)
 EXPORT_SYMBOL(pfn_valid);
 #endif
 
+#ifdef CONFIG_ARCH_RAPUYAMA
+unsigned long arm_ram_pfn_offset;
+EXPORT_SYMBOL(arm_ram_pfn_offset);
+#endif
+
 static bool arm_memblock_steal_permitted = true;
 
 phys_addr_t __init arm_memblock_steal(phys_addr_t size, phys_addr_t align)
@@ -195,6 +200,10 @@ void __init arm_memblock_init(const struct machine_desc *mdesc)
 		mdesc->reserve();
 
 	early_init_fdt_scan_reserved_mem();
+
+#ifdef CONFIG_ARCH_RAPUYAMA
+	arm_ram_pfn_offset = PFN_DOWN(memblock_start_of_DRAM());
+#endif
 
 	/* reserve memory for DMA contiguous allocations */
 	dma_contiguous_reserve(arm_dma_limit);

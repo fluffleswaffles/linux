@@ -19,6 +19,8 @@
 #define MXT_MAX_OBJ	64
 #define MXT_MAX_MSG	16
 #define MXT_POLL_MS	10
+#define MXT_IDLE_MS	50	/* no touch for MXT_FAST_POLLS polls */
+#define MXT_FAST_POLLS	50
 #define MXT_DRAIN	16	/* messages per poll at most */
 #define MXT_SLOTS	10
 
@@ -37,6 +39,7 @@ struct rapuyama_mxt {
 	u16 t5_addr, t7_addr, t9_addr;
 	u8 t5_size, t9_min_id, t9_max_id;
 	u16 xmax, ymax;
+	unsigned int fast;	/* polls left at MXT_POLL_MS */
 };
 
 /* the chip takes a little endian 16-bit register address first */
@@ -117,7 +120,12 @@ static void rapuyama_mxt_poll(struct input_dev *input)
 	if (any) {
 		input_mt_sync_frame(input);
 		input_sync(input);
+		ts->fast = MXT_FAST_POLLS;
+	} else if (ts->fast) {
+		ts->fast--;
 	}
+	/* each poll is an i2c read + an irq per byte: slow down when idle */
+	input_set_poll_interval(input, ts->fast ? MXT_POLL_MS : MXT_IDLE_MS);
 }
 
 /* walk the object table, note T5 / T7 / T9 and the T9 report ids */

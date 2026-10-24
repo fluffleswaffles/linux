@@ -29,6 +29,8 @@
 #include <drm/drm_simple_kms_helper.h>
 #include <linux/backlight.h>
 #include <linux/clk.h>
+#include <linux/completion.h>
+#include <linux/interrupt.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
@@ -101,6 +103,7 @@
 #define VCHI_SLOT_RX 0x1010		/* host rx slot we announce */
 #define VCHI_HOST_SLOTS 15
 #define VCHI_MAX_MSG 0x800
+#define VCHI_TX_MAX_MSG (VCHI_SLOT - 32) /* entry header and slot terminator */
 #define VCHI_BULK_PIECE 0x18000		/* vchi +0x357c */
 
 #define CTRL_CONNECT 0
@@ -132,7 +135,7 @@
 #define G_ADDR	0x80	/* source phys */
 #define G_88	0x88
 #define G_SIZE2	0x8c
-#define G_W	0x80	/* halfwords per line, Symbian always uses 0x80 */
+#define G_W	0x80	/* Linux bulk width; the ROM chooses dimensions per length */
 #define G_LINE	(G_W * 2)
 
 #define VC_W 640
@@ -193,6 +196,14 @@ static bool dma;
 module_param(dma, bool, 0444);
 MODULE_PARM_DESC(dma, "push frames with the gfx dma engine instead of PIO");
 
+static bool dma_irq = true;
+module_param(dma_irq, bool, 0444);
+MODULE_PARM_DESC(dma_irq, "wait for gfx DMA completion on its IRQ instead of busy polling");
+
+static bool dma_prime;
+module_param(dma_prime, bool, 0444);
+MODULE_PARM_DESC(dma_prime, "experimental bounded gfx startup pulse without reading the running counter");
+
 static bool khrn_probe;
 module_param(khrn_probe, bool, 0444);
 MODULE_PARM_DESC(khrn_probe, "after bring-up, try to open the VC khronos services (KHRN/KHHN/KHAN) and log the answer");
@@ -240,6 +251,10 @@ struct vc {
 	int dma_log;	/* log the steps of the first dma piece */
 	bool dma_ok;	/* frames go by dma (after the PIO bring-up) */
 	dma_addr_t push_phys;
+	int gfx_irq;
+	bool gfx_irq_enabled, dma_waiting;
+	u32 dma_status;
+	struct completion dma_done;
 
 	/* frame stats, logged every 10 s */
 	unsigned int st_frames, st_rows;
@@ -253,7 +268,7 @@ struct vc {
 	/* VCHI */
 	u8 rx[0x1100];
 	u8 *tx;		/* VCHI_SLOT bytes, gfx dma reads it */
-	u8 bulk_msg[VCHI_MAX_MSG];
+	u8 bulk_msg[VCHI_TX_MAX_MSG];
 	u32 tx_cur;
 	u32 credits_owed; /* rx slots we freed, returned in the next tx */
 	int tx_credits;	/* VC rx slots we may still fill */
@@ -416,6 +431,32 @@ static int vc_tx(struct vc *vc, const void *buf, u32 len, u32 chan)
 	return ret;
 }
 
+/* Firmware FUN_8032a020, IRQ 0x92. Only the IRQ-status register is read.
+ * Keep the controller masked until gfx init has completed. */
+static irqreturn_t vc_dma_interrupt(int irq, void *data)
+{
+	struct vc *vc = data;
+	u32 st = readl(vc->gfx + G_IRQ) & 0x1ffff;
+
+	(void)irq;
+	if (!st)
+		return IRQ_NONE;
+	writel(st, vc->gfx + G_IRQ);
+	if ((st & (1 | 0x40 | 0x8000)) && READ_ONCE(vc->dma_waiting)) {
+		WRITE_ONCE(vc->dma_status, st);
+		complete(&vc->dma_done);
+	}
+	return IRQ_HANDLED;
+}
+
+static void vc_dma_irq_stop(struct vc *vc)
+{
+	if (vc->gfx_irq_enabled) {
+		disable_irq(vc->gfx_irq);
+		vc->gfx_irq_enabled = false;
+	}
+}
+
 /*
  * one bulk piece through the gfx dma: channel word, the 256-byte lines by
  * dma, a short tail by PIO, channel word 0 (FUN_80329ec8, FUN_8032a020,
@@ -424,13 +465,18 @@ static int vc_tx(struct vc *vc, const void *buf, u32 len, u32 chan)
 static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 		     u32 chan)
 {
-	u32 lines = len / G_LINE, i, st;
+	u32 lines = len / G_LINE, i, st, latch, start;
 	int ret;
 
 	ret = vc_chan(vc, chan);
 	if (ret)
 		return ret;
 	if (lines) {
+		if (vc->gfx_irq_enabled) {
+			reinit_completion(&vc->dma_done);
+			WRITE_ONCE(vc->dma_status, 0);
+			WRITE_ONCE(vc->dma_waiting, true);
+		}
 		if (vc->dma_log)
 			dev_info(vc->dev, "dma 1st piece: addr %pad, %u lines\n",
 				 &phys, lines);
@@ -439,26 +485,55 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 		writel((G_W - 1) << 16 | (lines - 1), vc->gfx + G_SIZE2);
 		writel(0, vc->gfx + G_6C);
 		writel(0x8908, vc->gfx + G_GO);
-		writel(0x8908 | 0x20, vc->gfx + G_GO);
-		writel(0x8908 | 0x21, vc->gfx + G_GO);
+		/* FUN_8032faa0 then FUN_803296e8: preserve hardware changes
+		 * between the latch request and enable, and flush posted writes.
+		 */
+		latch = readl(vc->gfx + G_GO);
+		writel(latch | 0x20, vc->gfx + G_GO);
+		start = readl(vc->gfx + G_GO);
+		writel(start | 1, vc->gfx + G_GO);
 		vc_wr(vc, VC_DMACNT, lines * G_W);
 		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) | 0x11);
-		/* no sleep: it would be a whole jiffy (periodic timer) */
-		ret = readl_poll_timeout_atomic(vc->gfx + G_IRQ, st, st & 1, 1,
-						100000);
+		if (vc->gfx_irq_enabled) {
+			/* IRQ wakes the worker immediately, independent of timer ticks. */
+			ret = wait_for_completion_timeout(&vc->dma_done, msecs_to_jiffies(100)) ? 0 : -ETIMEDOUT;
+			if (ret) {
+				/* No ISR does not prove no DMA. Mask/synchronize the IRQ,
+				 * then inspect only the same status register the poller uses.
+				 * Preserve a completion delivered at the timeout boundary.
+				 */
+				vc_dma_irq_stop(vc);
+				st = READ_ONCE(vc->dma_status) | readl(vc->gfx + G_IRQ);
+				dev_warn(vc->dev, "gfx IRQ wait expired, hardware status %08x\n", st);
+				if ((st & 1) && !(st & (0x40 | 0x8000))) {
+					dev_warn(vc->dev, "gfx DMA completed without IRQ wake, continuing DMA with polling\n");
+					ret = 0;
+				}
+			} else {
+				st = READ_ONCE(vc->dma_status);
+			}
+			WRITE_ONCE(vc->dma_waiting, false);
+			if (!ret && (!(st & 1) || (st & (0x40 | 0x8000))))
+				ret = -EIO;
+		} else {
+			ret = readl_poll_timeout_atomic(vc->gfx + G_IRQ, st, st & 1, 1, 100000);
+		}
 		if (vc->dma_log) {
-			dev_info(vc->dev, "dma 1st piece: %s, irq %08x\n",
-				 ret ? "timeout" : "done", st);
+			dev_info(vc->dev, "dma 1st piece: %s, irq %08x, ctrl reads %08x %08x, wait %s\n",
+				 ret ? "failed" : "done", st, latch, start,
+				 vc->gfx_irq_enabled ? "irq" : "poll");
 			vc->dma_log = 0;
 		}
-		/* a stalled engine may also stall reads of its other registers */
-		writel(st & 0x1ffff, vc->gfx + G_IRQ);
+		/* IRQ handler already acknowledged status. Never inspect a stalled block. */
+		if (!vc->gfx_irq_enabled)
+			writel(st & 0x1ffff, vc->gfx + G_IRQ);
 		if (!ret)
 			ret = vc_idle(vc);
 		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) & ~0x11);
 		if (ret) {
+			vc_dma_irq_stop(vc);
 			vc->dma_ok = false;
-			dev_err(vc->dev, "gfx dma piece timed out, PIO from now on\n");
+			dev_err(vc->dev, "gfx dma piece failed (%d), PIO from now on\n", ret);
 			return ret;
 		}
 	}
@@ -474,6 +549,42 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
  * (reset), FUN_8032a154 (regs), FUN_80329c8c + FUN_80329c10 (self test:
  * 8 halfwords from memory in test mode, must end with +0x18 bit 0)
  */
+static int vc_gfx_prime(struct vc *vc)
+{
+	u32 st;
+	int ret;
+
+	/* FUN_80329c8c/FUN_80329c10: start eight halfwords, then stop
+	 * before waiting for frame done. Do not inspect the running block:
+	 * the old self test hung at an unidentified access. Unlike
+	 * the ROM this experimental pulse cannot prove fetch has started.
+	 */
+	writel(0, vc->gfx + G_1C);
+	writel(0x700000, vc->gfx + G_MODE);
+	writel(7, vc->gfx + G_SIZE);
+	writel(7, vc->gfx + G_SIZE2);
+	writel(0x18128, vc->gfx + G_GO);
+	writel(0xffffffff, vc->gfx + G_IRQ);
+	writel(0x18129, vc->gfx + G_GO);
+	udelay(20);
+	writel(0x18128, vc->gfx + G_GO);
+	ret = readl_poll_timeout_atomic(vc->gfx + G_IRQ, st,
+				       st & (1 | 0x40 | 0x8000), 1, 10000);
+	if (!ret && (!(st & 1) || (st & (0x40 | 0x8000))))
+		ret = -EIO;
+	dev_info(vc->dev, "gfx startup pulse: %s, status %08x\n",
+		 ret ? "failed" : "done", st);
+	/* No reads from any other gfx register after a failed pulse. */
+	writel(st & 0x1ffff, vc->gfx + G_IRQ);
+	if (ret)
+		return ret;
+	writel(0, vc->gfx + G_SIZE);
+	writel(0, vc->gfx + G_SIZE2);
+	writel(0, vc->gfx + G_MODE);
+	writel(0x5641, vc->gfx + G_1C);
+	return 0;
+}
+
 static int vc_gfx_init(struct vc *vc)
 {
 	u32 r, f, d, t, st;
@@ -518,6 +629,11 @@ static int vc_gfx_init(struct vc *vc)
 	writel(t - 0x100, vc->gfx + 0x22c);
 	writel(0x8d, vc->gfx + 0xa0);
 	writel(vc->push_phys, vc->gfx + G_ADDR);
+	if (dma_prime) {
+		ret = vc_gfx_prime(vc);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * no self test: the test mode run killed the phone. but it ends with
@@ -530,6 +646,10 @@ static int vc_gfx_init(struct vc *vc)
 	dev_info(vc->dev, "gfx dma: pll %u kHz, div %u, pixel div %08x, fifo %u, sysconfig %04x, init done\n",
 		 f, d, readl(vc->gfx + G_DIV), t, G_IDLE);
 	vc->dma_log = 1;
+	if (!ret && vc->gfx_irq > 0) {
+		enable_irq(vc->gfx_irq);
+		vc->gfx_irq_enabled = true;
+	}
 	return ret;
 }
 
@@ -784,7 +904,8 @@ static int vchi_slot_msg(struct vc *vc, u32 fourcc, const void *data, u32 n)
 	u32 ent = ALIGN(n + 16, 16);
 	u8 *h = vc->tx + vc->tx_cur;
 
-	if (vc->tx_cur + ent > VCHI_SLOT - 16 || n > VCHI_MAX_MSG)
+	if (vc->tx_cur + ent > VCHI_SLOT - 16 ||
+	    n > (fourcc == FCC_BULX ? VCHI_TX_MAX_MSG : VCHI_MAX_MSG))
 		return -E2BIG;
 	memset(h, 0, ent);
 	put_unaligned_le16(VCHI_MAGIC, h);
@@ -1100,9 +1221,18 @@ static int vchi_bulk_tx(struct vc *vc, u32 fourcc, const u8 *data, u32 size)
 	}
 
 	while (!(req = vchi_find_bulk_req(vc, fourcc))) {
-		ret = vchi_pump(vc, 20, NULL);
-		if (ret)
+		u32 received;
+
+		/* Stop as soon as the request arrives. pump(20, NULL) always
+		 * drains until its deadline, adding a polling window per upload.
+		 */
+		ret = vc_rx(vc, vc->rx, sizeof(vc->rx), &received, 20);
+		if (!ret) {
+			vchi_handle_slot(vc, received);
+			vchi_answer_queries(vc);
+		} else if (ret != -EAGAIN) {
 			return ret;
+		}
 		if (time_after(jiffies, end)) {
 			dev_err(vc->dev, "no bulk request from the VC\n");
 			return -ETIMEDOUT;
@@ -1116,16 +1246,25 @@ static int vchi_bulk_tx(struct vc *vc, u32 fourcc, const u8 *data, u32 size)
 	/* data is page aligned: no head, the aligned part, the rest as tail */
 	rx_size = min(size & ~31u, req->rx_size);
 	tail = size - rx_size;
-	if (0x1c + ALIGN(tail, 4) > VCHI_MAX_MSG)
+	if (0x1c + ALIGN(tail, 4) > sizeof(vc->bulk_msg)) {
+		dev_err(vc->dev, "bulk %4.4s: size %u, request %u, rx %u, offset %u, inline %u too large\n",
+			(char *)&fourcc, size, req->size, req->rx_size,
+			req->offset, tail);
 		return -EINVAL;
+	}
 	memset(msg, 0, 0x1c);
 	put_unaligned_le32(fourcc, msg);
 	put_unaligned_le32(size, msg + 4);
 	put_unaligned_le32(VCHI_BULK_PIECE, msg + 8);
 	put_unaligned_le32(rx_size, msg + 16);
-	put_unaligned_le16((u16)-req->offset, msg + 20);
-	msg[22] = 1;
-	put_unaligned_le16(tail, msg + 26);
+	/* Symbian FUN_80333678: no aligned receive area -> all data as head. */
+	if (rx_size) {
+		put_unaligned_le16((u16)-req->offset, msg + 20);
+		msg[22] = 1;
+		put_unaligned_le16(tail, msg + 26);
+	} else {
+		put_unaligned_le16(tail, msg + 24);
+	}
 	memcpy(msg + 0x1c, data + rx_size, tail);
 	n = 0x1c + ALIGN(tail, 4);
 	memset(msg + 0x1c + tail, 0, n - 0x1c - tail);
@@ -2525,8 +2664,20 @@ static void vc_khrn_serve(struct vc *vc)
 	*seen = false;
 	if (!ret)
 		ret = vchi_send(vc, r->fourcc, r->msg, r->len);
-	for (i = 0, off = 0; !ret && i < r->nbulk; off += r->sizes[i++])
-		ret = vchi_bulk_tx(vc, r->fourcc, r->bulk + off, r->sizes[i]);
+	for (i = 0, off = 0; !ret && i < r->nbulk; off += r->sizes[i++]) {
+		const u8 *data = r->bulk + off;
+
+		/* The gfx DMA cannot read kvmalloc memory. This thread also owns
+		 * the framebuffer staging area; bufm_write repacks it next time.
+		 */
+		if (vc->dma_ok && r->sizes[i] <= VC_FB_SIZE) {
+			dma_sync_single_for_cpu(vc->dev, vc->push_phys,
+						r->sizes[i], DMA_TO_DEVICE);
+			memcpy(vc->push, data, r->sizes[i]);
+			data = vc->push;
+		}
+		ret = vchi_bulk_tx(vc, r->fourcc, data, r->sizes[i]);
+	}
 	if (!ret && r->reply_max)
 		ret = vchi_pump(vc, 2000, seen);
 	r->reply_len = 0;
@@ -2665,6 +2816,7 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	vc->dspc_token = 0x100;
 	init_waitqueue_head(&vc->wq);
+	init_completion(&vc->dma_done);
 	spin_lock_init(&vc->band_lock);
 	mutex_init(&vc->fb_lock);
 	mutex_init(&vc->khrn_lock);
@@ -2738,6 +2890,26 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 		vfree(vc->fb);
 		return -ENOMEM;
 	}
+	if (dma && dma_irq) {
+		vc->gfx_irq = platform_get_irq_optional(pdev, 0);
+		if (vc->gfx_irq == -EPROBE_DEFER) {
+			ret = -EPROBE_DEFER;
+			goto err_fb;
+		}
+		if (vc->gfx_irq > 0) {
+			ret = devm_request_irq(dev, vc->gfx_irq, vc_dma_interrupt,
+					      IRQF_NO_AUTOEN, "videocore-dma", vc);
+			if (ret) {
+				dev_warn(dev, "gfx IRQ unavailable (%d), completion by polling\n", ret);
+				vc->gfx_irq = 0;
+			} else {
+				dev_info(dev, "gfx DMA completion on IRQ %d\n", vc->gfx_irq);
+			}
+		} else {
+			vc->gfx_irq = 0;
+			dev_info(dev, "no gfx IRQ in DT, completion by polling\n");
+		}
+	}
 	ret = vc_drm_init(vc);
 	if (!ret)
 		ret = vc_bl_register(vc);
@@ -2764,6 +2936,7 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 
 err_thread:
 	kthread_stop(vc->thread);
+	vc_dma_irq_stop(vc);
 err_fb:
 	vc_push_free(vc);
 	vfree(vc->fb);
@@ -2779,6 +2952,7 @@ static void rapuyama_videocore_remove(struct platform_device *pdev)
 	drm_dev_unplug(&vc->drm);
 	drm_atomic_helper_shutdown(&vc->drm);
 	kthread_stop(vc->thread);
+	vc_dma_irq_stop(vc);
 	vc_push_free(vc);
 	vfree(vc->fb);
 }

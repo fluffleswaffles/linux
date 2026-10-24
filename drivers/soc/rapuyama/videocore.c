@@ -194,7 +194,7 @@ MODULE_PARM_DESC(cold, "panel power-up path: 1 = cold (default), 0 = warm, -1 = 
 
 static bool dma;
 module_param(dma, bool, 0444);
-MODULE_PARM_DESC(dma, "push frames with the gfx dma engine instead of PIO");
+MODULE_PARM_DESC(dma, "require gfx DMA after bring-up; 0 selects PIO explicitly");
 
 static bool dma_irq = true;
 module_param(dma_irq, bool, 0444);
@@ -250,6 +250,7 @@ struct vc {
 	bool gfx_ok;	/* init passed */
 	int dma_log;	/* log the steps of the first dma piece */
 	bool dma_ok;	/* frames go by dma (after the PIO bring-up) */
+	int dma_error;	/* a failed transfer must not be replayed */
 	dma_addr_t push_phys;
 	int gfx_irq;
 	bool gfx_irq_enabled, dma_waiting;
@@ -280,6 +281,10 @@ struct vc {
 	bool svc_reply_seen;
 	u32 disp_reply;
 	bool disp_reply_seen;
+	u32 updates[16], update_wait;
+	unsigned int nupdates;
+	bool update_seen;
+	int update_error;
 	u8 bufm_reply[0x40];
 	/* khronos replies (khrn probe) */
 	u8 khrn_rx[0x200];
@@ -423,6 +428,8 @@ static int vc_tx(struct vc *vc, const void *buf, u32 len, u32 chan)
 	u32 i;
 	int ret;
 
+	if (vc->dma_error)
+		return vc->dma_error;
 	ret = vc_chan(vc, chan);
 	for (i = 0; !ret && i < len; i += 2)
 		ret = vc_wr16(vc, p[i] | (i + 1 < len ? p[i + 1] << 8 : 0));
@@ -443,7 +450,8 @@ static irqreturn_t vc_dma_interrupt(int irq, void *data)
 		return IRQ_NONE;
 	writel(st, vc->gfx + G_IRQ);
 	if ((st & (1 | 0x40 | 0x8000)) && READ_ONCE(vc->dma_waiting)) {
-		WRITE_ONCE(vc->dma_status, st);
+		/* Keep an earlier error if completion arrives before the worker runs. */
+		WRITE_ONCE(vc->dma_status, READ_ONCE(vc->dma_status) | st);
 		complete(&vc->dma_done);
 	}
 	return IRQ_HANDLED;
@@ -457,10 +465,19 @@ static void vc_dma_irq_stop(struct vc *vc)
 	}
 }
 
+static int vc_dma_fail(struct vc *vc, int ret)
+{
+	vc_dma_irq_stop(vc);
+	vc->dma_ok = false;
+	WRITE_ONCE(vc->dma_error, ret);
+	dev_err(vc->dev, "gfx DMA failed (%d), transport stopped; select videocore.dma=0 to boot with PIO\n", ret);
+	return ret;
+}
+
 /*
  * one bulk piece through the gfx dma: channel word, the 256-byte lines by
  * dma, a short tail by PIO, channel word 0 (FUN_80329ec8, FUN_8032a020,
- * FUN_8032a98c). a timeout turns dma off for good (that frame is lost)
+ * FUN_8032a98c). a failed transfer poisons the transport until reinitialization
  */
 static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 		     u32 chan)
@@ -468,9 +485,11 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 	u32 lines = len / G_LINE, i, st, latch, start;
 	int ret;
 
+	if (vc->dma_error)
+		return vc->dma_error;
 	ret = vc_chan(vc, chan);
 	if (ret)
-		return ret;
+		return vc_dma_fail(vc, ret);
 	if (lines) {
 		if (vc->gfx_irq_enabled) {
 			reinit_completion(&vc->dma_done);
@@ -516,7 +535,10 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 			if (!ret && (!(st & 1) || (st & (0x40 | 0x8000))))
 				ret = -EIO;
 		} else {
-			ret = readl_poll_timeout_atomic(vc->gfx + G_IRQ, st, st & 1, 1, 100000);
+			ret = readl_poll_timeout_atomic(vc->gfx + G_IRQ, st,
+						       st & (1 | 0x40 | 0x8000), 1, 100000);
+			if (!ret && (!(st & 1) || (st & (0x40 | 0x8000))))
+				ret = -EIO;
 		}
 		if (vc->dma_log) {
 			dev_info(vc->dev, "dma 1st piece: %s, irq %08x, ctrl reads %08x %08x, wait %s\n",
@@ -529,19 +551,20 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 			writel(st & 0x1ffff, vc->gfx + G_IRQ);
 		if (!ret)
 			ret = vc_idle(vc);
+		if (ret)
+			/* Capture the receiver before clearing enable; no stalled gfx reads */
+			dev_err(vc->dev, "gfx DMA error %d: ViSSI status %08x, control %08x, count %08x\n",
+				ret, vc_rd(vc, VC_STAT), vc_rd(vc, VC_DMACTL),
+				vc_rd(vc, VC_DMACNT));
 		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) & ~0x11);
-		if (ret) {
-			vc_dma_irq_stop(vc);
-			vc->dma_ok = false;
-			dev_err(vc->dev, "gfx dma piece failed (%d), PIO from now on\n", ret);
-			return ret;
-		}
+		if (ret)
+			return vc_dma_fail(vc, ret);
 	}
 	for (i = lines * G_LINE; !ret && i < len; i += 2)
 		ret = vc_wr16(vc, p[i] | (i + 1 < len ? p[i + 1] << 8 : 0));
 	if (!ret)
 		ret = vc_chan(vc, 0);
-	return ret;
+	return ret ? vc_dma_fail(vc, ret) : 0;
 }
 
 /*
@@ -684,14 +707,18 @@ static void vc_pads_init(struct vc *vc)
  */
 static int vc_bus_init(struct vc *vc)
 {
-	unsigned int i;
+	u32 st;
+	int ret;
 
 	dev_info(vc->dev, "bus left by symbian: mode %08x dmactl %08x 6c %08x 90 %08x tim %08x %08x\n",
 		 vc_rd(vc, VC_MODE), vc_rd(vc, VC_DMACTL), vc_rd(vc, VC_6C),
 		 vc_rd(vc, VC_90), vc_rd(vc, VC_TIM0), vc_rd(vc, VC_TIM1));
 	vc_wr(vc, VC_CTRL, 0x0a);
-	for (i = 0; i < 1000000 && (vc_rd(vc, VC_STAT) & 1); i++)
-		cpu_relax();
+	ret = readl_poll_timeout(vc->bus + VC_STAT, st, !(st & 1), 10, 10000);
+	if (ret) {
+		dev_err(vc->dev, "bus reset timed out: %08x\n", st);
+		return ret;
+	}
 	vc_wr(vc, VC_CTRL, 0x11);
 	vc_wr(vc, VC_MODE, VC_MODE_DATA);
 	vc_wr(vc, VC_6C, 0x10);
@@ -716,6 +743,8 @@ static int vc_rx(struct vc *vc, u8 *buf, u32 max, u32 *len,
 	unsigned int spins = 0;
 	int ret;
 
+	if (vc->dma_error)
+		return vc->dma_error;
 	if (!vc->rx_armed) {
 		ret = vc_chan(vc, 0);
 		if (ret)
@@ -849,8 +878,15 @@ static int vc_boot(struct vc *vc)
 	ret = vc_bus_init(vc);
 	if (ret)
 		return ret;
-	if (dma)
-		vc->gfx_ok = !vc_gfx_init(vc);
+	if (dma) {
+		ret = vc_gfx_init(vc);
+		if (ret) {
+			WRITE_ONCE(vc->dma_error, ret);
+			dev_err(vc->dev, "required gfx DMA init failed: %d\n", ret);
+			return ret;
+		}
+		vc->gfx_ok = true;
+	}
 	vc_timings(vc, true);
 	vc->rx_armed = false;
 	vc->last_status = 0;
@@ -928,6 +964,8 @@ static int vchi_slot_send(struct vc *vc)
 	u8 *h;
 	int ret;
 
+	if (vc->dma_error)
+		return vc->dma_error;
 	while (vc->tx_credits <= 0) {
 		ret = vchi_pump(vc, 1000, NULL);
 		if (ret)
@@ -955,13 +993,12 @@ static int vchi_slot_send(struct vc *vc)
 		dma_addr_t a = dma_map_single(vc->dev, vc->tx, VCHI_SLOT,
 					      DMA_TO_DEVICE);
 
-		if (!dma_mapping_error(vc->dev, a)) {
-			ret = vc_tx_dma(vc, vc->tx, a, VCHI_SLOT, 0);
-			dma_unmap_single(vc->dev, a, VCHI_SLOT, DMA_TO_DEVICE);
-			/* a timed out slot goes again by PIO, the message must arrive */
-			if (!ret)
-				return 0;
+		if (dma_mapping_error(vc->dev, a)) {
+			return vc_dma_fail(vc, -EIO);
 		}
+		ret = vc_tx_dma(vc, vc->tx, a, VCHI_SLOT, 0);
+		dma_unmap_single(vc->dev, a, VCHI_SLOT, DMA_TO_DEVICE);
+		return ret;
 	}
 	return vc_tx(vc, vc->tx, VCHI_SLOT, 0);
 }
@@ -978,6 +1015,8 @@ static int vchi_send(struct vc *vc, u32 fourcc, const void *data, u32 n)
 {
 	int ret;
 
+	if (vc->dma_error)
+		return vc->dma_error;
 	vchi_log(vc, "tx", fourcc, data, n);
 	vchi_slot_begin(vc);
 	ret = vchi_slot_msg(vc, fourcc, data, n);
@@ -1035,6 +1074,29 @@ static void vchi_ctrl_msg(struct vc *vc, const u8 *pl, u32 size)
 	}
 }
 
+/* UPDH carries the completed update handle (ROM vcdispmanvchi 80344f2c).
+ * The VC worker owns both the queue and waiter: no IRQ-side queue access. */
+static void vc_update_done(struct vc *vc, u32 update)
+{
+	unsigned int i;
+
+	if (!update || vc->update_error)
+		return;
+	if (update == vc->update_wait) {
+		vc->update_seen = true;
+		return;
+	}
+	for (i = 0; i < vc->nupdates; i++)
+		if (vc->updates[i] == update)
+			return;
+	if (vc->nupdates == ARRAY_SIZE(vc->updates)) {
+		vc->update_error = -ENOSPC;
+		vc->update_seen = true;
+		return;
+	}
+	vc->updates[vc->nupdates++] = update;
+}
+
 static void vchi_handle_slot(struct vc *vc, u32 n)
 {
 	u32 off = 0;
@@ -1059,6 +1121,8 @@ static void vchi_handle_slot(struct vc *vc, u32 n)
 			} else if (fcc == FCC_DISP && size == 4) {
 				vc->disp_reply = get_unaligned_le32(pl);
 				vc->disp_reply_seen = true;
+			} else if (fcc == FCC_UPDH && size >= 4) {
+				vc_update_done(vc, get_unaligned_le32(pl));
 			} else if (fcc == FCC_BFMX) {
 				memset(vc->bufm_reply, 0, sizeof(vc->bufm_reply));
 				memcpy(vc->bufm_reply, pl,
@@ -1078,7 +1142,6 @@ static void vchi_handle_slot(struct vc *vc, u32 n)
 				memcpy(vc->dspc_rx, pl, vc->dspc_rx_len);
 				vc->dspc_rx_seen = true;
 			}
-			/* UPDH: ignored */
 		}
 		off += ent;
 	}
@@ -1119,6 +1182,33 @@ static int vchi_pump(struct vc *vc, unsigned int timeout_ms, bool *cond)
 			return cond ? -ETIMEDOUT : 0;
 	}
 	return 0;
+}
+
+/* A completion may arrive during any other RPC, before this wait is queued. */
+static int vc_update_wait(struct vc *vc, u32 update)
+{
+	unsigned int i;
+	int ret;
+
+	if (!update)
+		return -EINVAL;
+	if (vc->update_error)
+		return vc->update_error;
+	for (i = 0; i < vc->nupdates; i++) {
+		if (vc->updates[i] != update)
+			continue;
+		vc->updates[i] = vc->updates[--vc->nupdates];
+		return 0;
+	}
+	vc->update_wait = update;
+	vc->update_seen = false;
+	ret = vchi_pump(vc, 2000, &vc->update_seen);
+	vc->update_wait = 0;
+	if (ret) {
+		vc->update_error = ret;
+		return ret;
+	}
+	return vc->update_error;
 }
 
 /* hand rx slots back when the VC keeps talking and we don't */
@@ -2327,7 +2417,7 @@ static int vc_thread(void *arg)
 		if (time_after(jiffies, vc->st_next)) {
 			if (vc->st_frames)
 				dev_info(vc->dev, "%u frames in 10 s (%s): push avg %llu us, max %llu us, avg %u rows\n",
-					 vc->st_frames, vc->dma_ok ? "dma" : "pio",
+					 vc->st_frames, vc->dma_error ? "dma failed" : vc->dma_ok ? "dma" : "pio",
 					 div_u64(vc->st_ns, vc->st_frames * 1000),
 					 div_u64(vc->st_max, 1000),
 					 vc->st_rows / vc->st_frames);
@@ -2630,6 +2720,8 @@ struct vc_khrn_msg {
 #define VC_KHRN_IOC_MSG _IOWR('V', 1, struct vc_khrn_msg)
 /* the dispman display the driver opened (DISP 0x1e and friends need it) */
 #define VC_KHRN_IOC_DISPLAY _IOR('V', 2, __u32)
+#define VC_KHRN_IOC_FEATURES _IOR('V', 3, __u32)
+#define VC_KHRN_FEATURE_UPDH 1
 #define VC_KHRN_MAX_BULK (1 << 20)
 #define VC_KHRN_MAX_PIECES 64	/* glShaderSource sends one per string */
 
@@ -2650,9 +2742,22 @@ static void vc_khrn_serve(struct vc *vc)
 	bool *seen = r->fourcc == FCC_DISP ? &vc->disp_reply_seen :
 		     &vc->khrn_rx_seen;
 	u32 i, off;
-	int ret = 0;
+	int ret = vc->dma_error;
 
-	if (!vc->khrn_open) {
+	if (r->fourcc == FCC_UPDH) {
+		if (!ret)
+			ret = vc_update_wait(vc, get_unaligned_le32(r->msg));
+		r->reply_len = 0;
+		if (!ret) {
+			memcpy(r->reply, r->msg, 4);
+			r->reply_len = 4;
+		}
+		r->ret = ret;
+		WRITE_ONCE(vc->kreq, NULL);
+		complete(&r->done);
+		return;
+	}
+	if (!ret && !vc->khrn_open) {
 		/* small bulks go inline like BFMX (open answer flags 0xd) */
 		ret = vchi_open_flags(vc, FCC_KHRN, 0x1c);
 		if (!ret)
@@ -2704,6 +2809,10 @@ static long vc_khrn_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	u32 i, total;
 	long ret;
 
+	if (READ_ONCE(vc->dma_error))
+		return READ_ONCE(vc->dma_error);
+	if (cmd == VC_KHRN_IOC_FEATURES)
+		return put_user(VC_KHRN_FEATURE_UPDH, (__u32 __user *)arg);
 	if (cmd == VC_KHRN_IOC_DISPLAY) {
 		if (!READ_ONCE(vc->ready))
 			return -EAGAIN;
@@ -2713,9 +2822,11 @@ static long vc_khrn_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		return -ENOTTY;
 	if (copy_from_user(&m, (void __user *)arg, sizeof(m)))
 		return -EFAULT;
-	if ((m.fourcc != FCC_KHRN && m.fourcc != FCC_DISP) ||
+	if ((m.fourcc != FCC_KHRN && m.fourcc != FCC_DISP && m.fourcc != FCC_UPDH) ||
 	    !m.len || m.len > VCHI_MAX_MSG || m.nbulk > VC_KHRN_MAX_PIECES ||
 	    (m.nbulk && m.fourcc != FCC_KHRN))
+		return -EINVAL;
+	if (m.fourcc == FCC_UPDH && (m.len != 4 || m.nbulk || m.reply_max != 4))
 		return -EINVAL;
 	if (!READ_ONCE(vc->ready))
 		return -EAGAIN;
@@ -2750,6 +2861,11 @@ static long vc_khrn_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			goto out;
 	}
 	mutex_lock(&vc->khrn_lock);
+	ret = READ_ONCE(vc->dma_error);
+	if (ret) {
+		mutex_unlock(&vc->khrn_lock);
+		goto out;
+	}
 	WRITE_ONCE(vc->kreq, r);
 	wake_up(&vc->wq);
 	/* uninterruptible: the thread owns r until it completes */
@@ -2791,6 +2907,8 @@ static void vc_push_release(struct vc *vc)
 
 static void vc_push_free(struct vc *vc)
 {
+	if (!vc->push)
+		return;
 	if (!dma) {
 		vfree(vc->push);
 		return;
@@ -2852,8 +2970,11 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 		vc->gdiv = devm_platform_ioremap_resource(pdev, 3);
 		if (IS_ERR(vc->gfx) || IS_ERR(vc->pll) || IS_ERR(vc->gdiv) ||
 		    dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
-			dev_warn(dev, "no gfx dma regs in the dt, PIO\n");
-			dma = false;
+			ret = IS_ERR(vc->gfx) ? PTR_ERR(vc->gfx) :
+			      IS_ERR(vc->pll) ? PTR_ERR(vc->pll) :
+			      IS_ERR(vc->gdiv) ? PTR_ERR(vc->gdiv) : -EIO;
+			dev_err_probe(dev, ret, "required gfx DMA resources unavailable\n");
+			goto err_fb;
 		}
 	}
 	if (dma) {
@@ -2873,8 +2994,9 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 				vc_push_release(vc);
 		}
 		if (!vc->push) {
-			dev_warn(dev, "no contiguous push buffer, PIO\n");
-			dma = false;
+			ret = -ENOMEM;
+			dev_err(dev, "required gfx DMA buffer unavailable\n");
+			goto err_fb;
 		}
 		if (vc->push) {
 			phys_addr_t tx = virt_to_phys(vc->tx);

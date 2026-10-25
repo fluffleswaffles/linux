@@ -14,6 +14,7 @@
  *
  * the optional charger phandle supplies charging status
  */
+#include <linux/devm-helpers.h>
 #include <linux/kernel.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
@@ -22,6 +23,7 @@
 #include <linux/power_supply.h>
 #include <linux/soc/rapuyama-pmic.h>
 #include <linux/soc/rapuyama-usb.h>
+#include <linux/workqueue.h>
 
 #define ADC_VBAT	8
 #define ADC_BTEMP	2
@@ -112,6 +114,51 @@ static int ry_bat_capacity(int mv)
 	return 100;
 }
 
+#define PCT_HOLD	60
+
+struct ry_bat {
+	struct power_supply *bat, *usb;
+	struct delayed_work poll;
+	int charger;
+	int mv16;	/* vbat averaged over ~16 s, mV * 16 */
+	int pct, hold;
+};
+
+
+static void ry_bat_track(struct ry_bat *rb)
+{
+	int mv, want;
+
+	if (ry_bat_vbat_mv(&mv))
+		return;
+	rb->mv16 += mv - rb->mv16 / 16;
+	want = ry_bat_capacity(rb->mv16 / 16);
+	if (rb->hold > 0) {
+		rb->hold--;
+		return;
+	}
+	if ((rb->charger && want > rb->pct) || (!rb->charger && want < rb->pct)) {
+		rb->pct += want > rb->pct ? 1 : -1;
+		rb->hold = PCT_HOLD;
+		power_supply_changed(rb->bat);
+	}
+}
+
+/* the charger has no irq: watch vchar so a plug reaches userspace within a second */
+static void ry_bat_poll(struct work_struct *work)
+{
+	struct ry_bat *rb = container_of(to_delayed_work(work), struct ry_bat, poll);
+	int in = ry_bat_charger();
+
+	ry_bat_track(rb);
+	if (in != rb->charger) {
+		rb->charger = in;
+		power_supply_changed(rb->usb);
+		power_supply_changed(rb->bat);
+	}
+	schedule_delayed_work(&rb->poll, HZ);
+}
+
 static int ry_bat_get(struct power_supply *psy, enum power_supply_property psp,
 		      union power_supply_propval *val)
 {
@@ -145,8 +192,7 @@ static int ry_bat_get(struct power_supply *psy, enum power_supply_property psp,
 		val->intval = mv * 1000;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		ret = ry_bat_vbat_mv(&mv);
-		val->intval = ry_bat_capacity(mv);
+		val->intval = ((struct ry_bat *)power_supply_get_drvdata(psy))->pct;
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		ret = ry_bat_temp(&val->intval);
@@ -209,22 +255,33 @@ static int ry_bat_probe(struct platform_device *pdev)
 {
 	struct power_supply_config cfg = { .of_node = pdev->dev.of_node };
 	struct power_supply_config usb_cfg = { };
-	struct power_supply *psy;
+	struct ry_bat *rb;
 	int mv, dc, ret;
 
+	rb = devm_kzalloc(&pdev->dev, sizeof(*rb), GFP_KERNEL);
+	if (!rb)
+		return -ENOMEM;
 	ret = ry_bat_vbat_mv(&mv);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "no pmic adc\n");
-	psy = devm_power_supply_register(&pdev->dev, &ry_bat_desc, &cfg);
-	if (IS_ERR(psy))
-		return PTR_ERR(psy);
+	rb->charger = ry_bat_charger();
+	rb->mv16 = mv * 16;
+	rb->pct = ry_bat_capacity(mv);
+	cfg.drv_data = rb;
+	rb->bat = devm_power_supply_register(&pdev->dev, &ry_bat_desc, &cfg);
+	if (IS_ERR(rb->bat))
+		return PTR_ERR(rb->bat);
 	usb_cfg.of_node = of_get_child_by_name(pdev->dev.of_node, "usb");
 	ret = devm_add_action_or_reset(&pdev->dev, ry_bat_put_node, usb_cfg.of_node);
 	if (ret)
 		return ret;
-	psy = devm_power_supply_register(&pdev->dev, &ry_usb_desc, &usb_cfg);
-	if (IS_ERR(psy))
-		return PTR_ERR(psy);
+	rb->usb = devm_power_supply_register(&pdev->dev, &ry_usb_desc, &usb_cfg);
+	if (IS_ERR(rb->usb))
+		return PTR_ERR(rb->usb);
+	ret = devm_delayed_work_autocancel(&pdev->dev, &rb->poll, ry_bat_poll);
+	if (ret)
+		return ret;
+	schedule_delayed_work(&rb->poll, HZ);
 	if (ry_bat_temp(&dc))
 		dev_info(&pdev->dev, "%d mV, no temperature, charger %s\n", mv,
 			 ry_bat_charger() ? "in" : "out");

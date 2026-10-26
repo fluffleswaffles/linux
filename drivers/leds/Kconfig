@@ -973,4 +973,12 @@ source "drivers/leds/trigger/Kconfig"
 comment "Simple LED drivers"
 source "drivers/leds/simple/Kconfig"
 
+config LEDS_E6_KEYBOARD
+	tristate "Nokia E6 keyboard backlight"
+	depends on I2C && LEDS_CLASS
+	help
+	  Control the E6 keyboard PWM channels on the LP5523, keeping the
+	  firmware clock, current and power-saving configuration.
+
 endif # NEW_LEDS
+# end of led drivers

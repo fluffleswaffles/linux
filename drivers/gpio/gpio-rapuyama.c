@@ -14,7 +14,9 @@
  *                      0x94 + 0x10 * k   write: bits -> high
  *                      0x98 + 0x10 * k   write: bits -> low
  *   out bank 6:        0x1b0 / 0x1b4 / 0x1b8
- *   in bank k (0-4):   0xf0 + 0x10 * k   read: pin level
+ *   in bank k (0-4):   0xf0 + 0x10 * k   read: doesn't follow the lock
+ *                                        switch (gpio 79), get() uses the
+ *                                        raw state below like switch.dll
  *                      0xf4 + 0x10 * k   write: bits -> input
  *                      0xf8 + 0x10 * k   write: bits -> output
  *
@@ -55,6 +57,7 @@
 
 #define RY_IRQ_BANK(k)	(0x40 * (k))
 #define RY_IRQ_BANK_EN	0x04
+#define RY_IRQ_RAW	0x08
 #define RY_IRQ_EN	0x10
 #define RY_IRQ_DIS	0x14
 #define RY_IRQ_ENABLED	0x18
@@ -113,7 +116,9 @@ static int rapuyama_gpio_get(struct gpio_chip *gc, unsigned int off)
 
 	if (k >= RY_GPIO_IN_BANKS || (ry->dir_out[k] & ry_bit(off)))
 		return !!(readl(ry->base + RY_OUT(k)) & ry_bit(off));
-	return !!(readl(ry->base + RY_IN(k)) & ry_bit(off));
+	if (IS_ERR(ry->irq_base))
+		return !!(readl(ry->base + RY_IN(k)) & ry_bit(off));
+	return !!(readl(ry->irq_base + RY_IRQ_BANK(k) + RY_IRQ_RAW) & ry_bit(off));
 }
 
 static void rapuyama_gpio_set(struct gpio_chip *gc, unsigned int off, int val)

@@ -38,6 +38,7 @@
 #include <asm/mach/map.h>
 
 #include "lowmem.h"
+#include "idle.h"
 
 #define RY_BUS_PHYS	0x20000000
 #define RY_BUS_VIRT	0xf8000000
@@ -132,6 +133,7 @@ static void __init rapuyama_init_early(void)
 {
 	hook_fault_code(8, rapuyama_ext_abort, SIGBUS, 0,
 			"external abort on non-linefetch");
+	rapuyama_idle_init_early();
 	rapuyama_lowmem_init_early();
 }
 

@@ -250,7 +250,7 @@ struct vc {
 	bool gfx_ok;	/* init passed */
 	int dma_log;	/* log the steps of the first dma piece */
 	bool dma_ok;	/* frames go by dma (after the PIO bring-up) */
-	int dma_error;	/* a failed transfer must not be replayed */
+	int transport_error;	/* a failed PIO or DMA transfer must not be replayed */
 	dma_addr_t push_phys;
 	int gfx_irq;
 	bool gfx_irq_enabled, dma_waiting;
@@ -417,27 +417,6 @@ static int vc_status(struct vc *vc, u32 *st)
 	return ret;
 }
 
-/*
- * one transfer: channel word, halfwords, then channel word 0. The firmware's
- * completion DFC (FUN_80329a48 -> FUN_8032a98c) writes the 0 after every
- * transfer, that is what ends it for the VC.
- */
-static int vc_tx(struct vc *vc, const void *buf, u32 len, u32 chan)
-{
-	const u8 *p = buf;
-	u32 i;
-	int ret;
-
-	if (vc->dma_error)
-		return vc->dma_error;
-	ret = vc_chan(vc, chan);
-	for (i = 0; !ret && i < len; i += 2)
-		ret = vc_wr16(vc, p[i] | (i + 1 < len ? p[i + 1] << 8 : 0));
-	if (!ret)
-		ret = vc_chan(vc, 0);
-	return ret;
-}
-
 /* Firmware FUN_8032a020, IRQ 0x92. Only the IRQ-status register is read.
  * Keep the controller masked until gfx init has completed. */
 static irqreturn_t vc_dma_interrupt(int irq, void *data)
@@ -465,13 +444,32 @@ static void vc_dma_irq_stop(struct vc *vc)
 	}
 }
 
-static int vc_dma_fail(struct vc *vc, int ret)
+static int vc_transport_fail(struct vc *vc, int ret)
 {
+	if (vc->transport_error)
+		return vc->transport_error;
 	vc_dma_irq_stop(vc);
+	WRITE_ONCE(vc->transport_error, ret);
+	dev_err(vc->dev, "%s transfer failed (%d), transport stopped\n",
+		vc->dma_ok ? "DMA" : "PIO", ret);
 	vc->dma_ok = false;
-	WRITE_ONCE(vc->dma_error, ret);
-	dev_err(vc->dev, "gfx DMA failed (%d), transport stopped; select videocore.dma=0 to boot with PIO\n", ret);
 	return ret;
+}
+
+static int vc_tx(struct vc *vc, const void *buf, u32 len, u32 chan)
+{
+	const u8 *p = buf;
+	u32 i;
+	int ret;
+
+	if (vc->transport_error)
+		return vc->transport_error;
+	ret = vc_chan(vc, chan);
+	for (i = 0; !ret && i < len; i += 2)
+		ret = vc_wr16(vc, p[i] | (i + 1 < len ? p[i + 1] << 8 : 0));
+	if (!ret)
+		ret = vc_chan(vc, 0);
+	return ret ? vc_transport_fail(vc, ret) : 0;
 }
 
 /*
@@ -485,11 +483,11 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 	u32 lines = len / G_LINE, i, st, latch, start;
 	int ret;
 
-	if (vc->dma_error)
-		return vc->dma_error;
+	if (vc->transport_error)
+		return vc->transport_error;
 	ret = vc_chan(vc, chan);
 	if (ret)
-		return vc_dma_fail(vc, ret);
+		return vc_transport_fail(vc, ret);
 	if (lines) {
 		if (vc->gfx_irq_enabled) {
 			reinit_completion(&vc->dma_done);
@@ -558,13 +556,13 @@ static int vc_tx_dma(struct vc *vc, const u8 *p, dma_addr_t phys, u32 len,
 				vc_rd(vc, VC_DMACNT));
 		vc_wr(vc, VC_DMACTL, vc_rd(vc, VC_DMACTL) & ~0x11);
 		if (ret)
-			return vc_dma_fail(vc, ret);
+			return vc_transport_fail(vc, ret);
 	}
 	for (i = lines * G_LINE; !ret && i < len; i += 2)
 		ret = vc_wr16(vc, p[i] | (i + 1 < len ? p[i + 1] << 8 : 0));
 	if (!ret)
 		ret = vc_chan(vc, 0);
-	return ret ? vc_dma_fail(vc, ret) : 0;
+	return ret ? vc_transport_fail(vc, ret) : 0;
 }
 
 /*
@@ -743,8 +741,8 @@ static int vc_rx(struct vc *vc, u8 *buf, u32 max, u32 *len,
 	unsigned int spins = 0;
 	int ret;
 
-	if (vc->dma_error)
-		return vc->dma_error;
+	if (vc->transport_error)
+		return vc->transport_error;
 	if (!vc->rx_armed) {
 		ret = vc_chan(vc, 0);
 		if (ret)
@@ -881,7 +879,7 @@ static int vc_boot(struct vc *vc)
 	if (dma) {
 		ret = vc_gfx_init(vc);
 		if (ret) {
-			WRITE_ONCE(vc->dma_error, ret);
+			WRITE_ONCE(vc->transport_error, ret);
 			dev_err(vc->dev, "required gfx DMA init failed: %d\n", ret);
 			return ret;
 		}
@@ -964,8 +962,8 @@ static int vchi_slot_send(struct vc *vc)
 	u8 *h;
 	int ret;
 
-	if (vc->dma_error)
-		return vc->dma_error;
+	if (vc->transport_error)
+		return vc->transport_error;
 	while (vc->tx_credits <= 0) {
 		ret = vchi_pump(vc, 1000, NULL);
 		if (ret)
@@ -990,14 +988,15 @@ static int vchi_slot_send(struct vc *vc)
 	vc->tx_credits--;
 	/* Symbian: PIO only up to 48 bytes, everything longer by dma */
 	if (vc->dma_ok) {
-		dma_addr_t a = dma_map_single(vc->dev, vc->tx, VCHI_SLOT,
+		u32 bytes = VCHI_SLOT / G_LINE * G_LINE;
+		dma_addr_t a = dma_map_single(vc->dev, vc->tx, bytes,
 					      DMA_TO_DEVICE);
 
 		if (dma_mapping_error(vc->dev, a)) {
-			return vc_dma_fail(vc, -EIO);
+			return vc_transport_fail(vc, -EIO);
 		}
 		ret = vc_tx_dma(vc, vc->tx, a, VCHI_SLOT, 0);
-		dma_unmap_single(vc->dev, a, VCHI_SLOT, DMA_TO_DEVICE);
+		dma_unmap_single(vc->dev, a, bytes, DMA_TO_DEVICE);
 		return ret;
 	}
 	return vc_tx(vc, vc->tx, VCHI_SLOT, 0);
@@ -1015,8 +1014,8 @@ static int vchi_send(struct vc *vc, u32 fourcc, const void *data, u32 n)
 {
 	int ret;
 
-	if (vc->dma_error)
-		return vc->dma_error;
+	if (vc->transport_error)
+		return vc->transport_error;
 	vchi_log(vc, "tx", fourcc, data, n);
 	vchi_slot_begin(vc);
 	ret = vchi_slot_msg(vc, fourcc, data, n);
@@ -1298,6 +1297,8 @@ static int vchi_bulk_tx(struct vc *vc, u32 fourcc, const u8 *data, u32 size)
 	u32 rx_size, tail, n, done, piece;
 	int ret;
 
+	if (vc->transport_error)
+		return vc->transport_error;
 	if (0x1c + ALIGN(size, 4) <= VCHI_MAX_MSG) {
 		memset(msg, 0, 0x1c);
 		put_unaligned_le32(fourcc, msg);
@@ -1368,9 +1369,17 @@ static int vchi_bulk_tx(struct vc *vc, u32 fourcc, const u8 *data, u32 size)
 		    data < (u8 *)vc->push + VC_FB_SIZE) {
 			dma_addr_t a = vc->push_phys + (data + done - (u8 *)vc->push);
 
-			dma_sync_single_for_device(vc->dev, a, piece, DMA_TO_DEVICE);
+			u32 bytes = piece / G_LINE * G_LINE;
+			u32 offset = data + done - (u8 *)vc->push;
+
+			if (bytes)
+				dma_sync_single_range_for_device(vc->dev, vc->push_phys,
+						offset, bytes, DMA_TO_DEVICE);
 			ret = vc_tx_dma(vc, data + done, a, piece,
 					done + piece == rx_size ? 3 : 1);
+			if (!ret && bytes)
+				dma_sync_single_range_for_cpu(vc->dev, vc->push_phys,
+						offset, bytes, DMA_TO_DEVICE);
 		} else
 			ret = vc_tx(vc, data + done, piece,
 				    done + piece == rx_size ? 3 : 1);
@@ -1456,6 +1465,10 @@ static int dspc_simple(struct vc *vc, u32 cmd, u32 arg)
  * 0x72) as FUN_80359c44 + FUN_80340d50 build it for interface 4: 640x480,
  * format 2, porches 10/20/2 and 3/3/3, 20 MHz pixel clock, 2 MHz cmd clock
  */
+static unsigned int panel_clk = 24000000;
+module_param(panel_clk, uint, 0444);
+MODULE_PARM_DESC(panel_clk, "panel write clock in Hz the VC is asked for (Symbian 20000000)");
+
 static int dspc_config(struct vc *vc)
 {
 	static const u16 h16[12] = { VC_W, VC_H, 2, 0, 1, 0xffff,
@@ -1465,7 +1478,7 @@ static int dspc_config(struct vc *vc)
 
 	for (i = 0; i < ARRAY_SIZE(h16); i++)
 		put_unaligned_le16(h16[i], pl + 2 * i);
-	put_unaligned_le32(20000000, pl + 24);
+	put_unaligned_le32(panel_clk, pl + 24);
 	put_unaligned_le32(2000000, pl + 28);
 	return dspc_send(vc, 0, DSPC_ID, 3, 0, pl, sizeof(pl));
 }
@@ -1755,6 +1768,8 @@ static int bufm_write(struct vc *vc, u32 y, u32 h)
 	__le32 w[15];
 	int ret;
 
+	if (vc->transport_error)
+		return vc->transport_error;
 	/* the test pattern puts its frame straight into push */
 	if (!vc->push_ready) {
 		mutex_lock(&vc->fb_lock);
@@ -2417,7 +2432,7 @@ static int vc_thread(void *arg)
 		if (time_after(jiffies, vc->st_next)) {
 			if (vc->st_frames)
 				dev_info(vc->dev, "%u frames in 10 s (%s): push avg %llu us, max %llu us, avg %u rows\n",
-					 vc->st_frames, vc->dma_error ? "dma failed" : vc->dma_ok ? "dma" : "pio",
+					 vc->st_frames, vc->transport_error ? "transport failed" : vc->dma_ok ? "dma" : "pio",
 					 div_u64(vc->st_ns, vc->st_frames * 1000),
 					 div_u64(vc->st_max, 1000),
 					 vc->st_rows / vc->st_frames);
@@ -2742,7 +2757,7 @@ static void vc_khrn_serve(struct vc *vc)
 	bool *seen = r->fourcc == FCC_DISP ? &vc->disp_reply_seen :
 		     &vc->khrn_rx_seen;
 	u32 i, off;
-	int ret = vc->dma_error;
+	int ret = vc->transport_error;
 
 	if (r->fourcc == FCC_UPDH) {
 		if (!ret)
@@ -2776,8 +2791,6 @@ static void vc_khrn_serve(struct vc *vc)
 		 * the framebuffer staging area; bufm_write repacks it next time.
 		 */
 		if (vc->dma_ok && r->sizes[i] <= VC_FB_SIZE) {
-			dma_sync_single_for_cpu(vc->dev, vc->push_phys,
-						r->sizes[i], DMA_TO_DEVICE);
 			memcpy(vc->push, data, r->sizes[i]);
 			data = vc->push;
 		}
@@ -2809,8 +2822,8 @@ static long vc_khrn_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	u32 i, total;
 	long ret;
 
-	if (READ_ONCE(vc->dma_error))
-		return READ_ONCE(vc->dma_error);
+	if (READ_ONCE(vc->transport_error))
+		return READ_ONCE(vc->transport_error);
 	if (cmd == VC_KHRN_IOC_FEATURES)
 		return put_user(VC_KHRN_FEATURE_UPDH, (__u32 __user *)arg);
 	if (cmd == VC_KHRN_IOC_DISPLAY) {
@@ -2861,7 +2874,7 @@ static long vc_khrn_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			goto out;
 	}
 	mutex_lock(&vc->khrn_lock);
-	ret = READ_ONCE(vc->dma_error);
+	ret = READ_ONCE(vc->transport_error);
 	if (ret) {
 		mutex_unlock(&vc->khrn_lock);
 		goto out;
@@ -2992,6 +3005,10 @@ static int rapuyama_videocore_probe(struct platform_device *pdev)
 						       DMA_TO_DEVICE);
 			if (dma_mapping_error(dev, vc->push_phys))
 				vc_push_release(vc);
+			else
+				/* only the submitted DMA lines leave CPU ownership */
+				dma_sync_single_for_cpu(dev, vc->push_phys,
+							VC_FB_SIZE, DMA_TO_DEVICE);
 		}
 		if (!vc->push) {
 			ret = -ENOMEM;

@@ -831,8 +831,16 @@ static const char *const rapuyama_dt_compat[] __initconst = {
 	NULL
 };
 
+/* symbian leaves the L220 on and its ctrl/aux are secure: never write them */
+static void rapuyama_l2c_write_sec(unsigned long val, unsigned int reg)
+{
+}
+
 DT_MACHINE_START(RAPUYAMA, "Nokia RapuYama")
 	.dt_compat	= rapuyama_dt_compat,
+	.l2c_aux_val	= 0,
+	.l2c_aux_mask	= ~0,
+	.l2c_write_sec	= rapuyama_l2c_write_sec,
 	.map_io		= rapuyama_map_io,
 	.reserve	= rapuyama_lowmem_reserve,
 	.init_early	= rapuyama_init_early,

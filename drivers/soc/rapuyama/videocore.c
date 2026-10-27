@@ -1127,8 +1127,9 @@ static void vchi_handle_slot(struct vc *vc, u32 n)
 				memcpy(vc->bufm_reply, pl,
 				       min_t(u32, size, sizeof(vc->bufm_reply)));
 				vc->bufm_reply_seen = true;
-			} else if (fcc == FCC_KHRN || fcc == FCC_KHHN ||
-				   fcc == FCC_KHAN) {
+			} else if (fcc == FCC_KHAN) {
+				/* you people are insane and i hate you */
+			} else if (fcc == FCC_KHRN || fcc == FCC_KHHN) {
 				vc->khrn_rx_len = min_t(u32, size,
 							sizeof(vc->khrn_rx));
 				memcpy(vc->khrn_rx, pl, vc->khrn_rx_len);

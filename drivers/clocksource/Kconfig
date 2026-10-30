@@ -140,6 +140,13 @@ config RAPUYAMA_TIMER
 	help
 	  Enables the ms timer and the 32 kHz counter of the Nokia RapuYama SoC.
 
+config RAPUYAMA_E5_TIMER
+	bool "Nokia E5-00 RapuYama system tick" if COMPILE_TEST
+	select TIMER_OF
+	help
+	  Enables the 1 kHz hardware tick (irq 35) and the 32 kHz counter of
+	  the Nokia E5-00 (RM-632).
+
 config REALTEK_OTTO_TIMER
 	bool "Clocksource/timer for the Realtek Otto platform" if COMPILE_TEST
 	select TIMER_OF

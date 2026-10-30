@@ -4,6 +4,7 @@ config ARCH_RAPUYAMA
 	depends on ARCH_MULTI_V6
 	select RAPUYAMA_INTC
 	select RAPUYAMA_TIMER
+	select RAPUYAMA_E5_TIMER
 	select GPIOLIB
 	select COMMON_CLK
 	imply GPIO_RAPUYAMA

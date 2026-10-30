@@ -3,6 +3,7 @@
 #define __MACH_RAPUYAMA_LOWMEM_H
 
 void rapuyama_lowmem_reserve(void);
+void rapuyama_swd_reserve(void);
 void rapuyama_lowmem_init_early(void);
 
 #endif

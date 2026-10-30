@@ -131,6 +131,7 @@ void __init rapuyama_lowmem_reserve(void)
 	phys_addr_t push;
 
 	ry_kbase = round_down(__pa_symbol(_text), SZ_2M);
+	rapuyama_swd_reserve();
 	push = round_up(__pa_symbol(_end), SZ_64K);
 	if (push + RY_VC_PUSH + RY_VC_TX <= ry_kbase + RY_DTB_OFF &&
 	    !memblock_reserve(push, RY_VC_PUSH + RY_VC_TX)) {

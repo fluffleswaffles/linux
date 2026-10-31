@@ -296,6 +296,14 @@ config KEYBOARD_TCA8418
 	  To compile this driver as a module, choose M here: the
 	  module will be called tca8418_keypad.
 
+config KEYBOARD_RAPUYAMA_E5
+	bool "Nokia E5-00 RapuYama keyboard matrix"
+	depends on ARCH_RAPUYAMA && OF
+	select INPUT_MATRIXKMAP
+	help
+	  Polled 8x8 QWERTY matrix of the Nokia E5-00, scanned the way the
+	  Symbian ekeyb.dll does it.
+
 config KEYBOARD_MATRIX
 	tristate "GPIO driven matrix keypad support"
 	depends on GPIOLIB || COMPILE_TEST

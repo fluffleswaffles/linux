@@ -124,6 +124,7 @@ obj-$(CONFIG_FB_OF)               += offb.o
 obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
 obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
 obj-$(CONFIG_FB_RAPUYAMA)         += rapuyama-fbmem.o
+obj-$(CONFIG_FB_RAPUYAMA_E5)      += rapuyama-e5-fb.o
 
 # the test framebuffer is last
 obj-$(CONFIG_FB_VIRTUAL)          += vfb.o

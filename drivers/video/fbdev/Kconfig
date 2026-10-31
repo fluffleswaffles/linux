@@ -1785,6 +1785,16 @@ config FB_RAPUYAMA
 	  only maps framebuffer memory; it does not communicate with VideoCore
 	  and does not refresh the command-mode panel.
 
+config FB_RAPUYAMA_E5
+	bool "Nokia E5-00 RapuYama RFBI panel framebuffer"
+	depends on FB && ARCH_RAPUYAMA && OF
+	select FB_SYSMEM_HELPERS_DEFERRED
+	help
+	  Framebuffer for the Nokia E5-00 command-mode panel behind the
+	  OMAP2-style RFBI that Symbian leaves set up. A shadow buffer is
+	  pushed to the panel by the CPU (DCS window + RAMWR, three bytes
+	  per pixel). Usable with fbcon.
+
 config FB_SIMPLE
 	tristate "Simple framebuffer support"
 	depends on FB

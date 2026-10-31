@@ -36,6 +36,9 @@
 /* gpio block (phys 0x20031900): output set / clear, bank k */
 #define GPIO_OUT_SET(k)	(0x94 + 0x10 * (k))
 #define GPIO_OUT_CLR(k)	(0x98 + 0x10 * (k))
+/* direction, write 1 = that pin becomes input / output (egpio, K0) */
+#define GPIO_DIR_IN(k)	(0xf4 + 0x10 * (k))
+#define GPIO_DIR_OUT(k)	(0xf8 + 0x10 * (k))
 /* irq block (phys 0x20033400): raw pin state, logical bank k */
 #define IRQ_RAW(k)	(0x40 * (k) + 0x08)
 
@@ -46,6 +49,14 @@ static const u8 e5kp_col_gpio[E5KP_COLS] = { 0, 3, 13, 33, 36, 38, 45, 55 };
 static bool learn;
 module_param(learn, bool, 0644);
 MODULE_PARM_DESC(learn, "log every key change as row/column (default off)");
+
+/* two keys on one row tie a low and a high column together when the idle
+ * columns are driven high: the row then reads wrong (sym+@ on r0). hiz=1
+ * floats the idle columns (input) instead, only the scanned one drives low
+ */
+static bool hiz = true;
+module_param(hiz, bool, 0644);
+MODULE_PARM_DESC(hiz, "float idle columns while scanning (default on, 0 = drive them high)");
 
 static unsigned int poll_ms = 20;
 module_param(poll_ms, uint, 0644);
@@ -71,6 +82,15 @@ struct e5kp {
 	u8 state[E5KP_COLS];		/* reported: bit r of state[c] = pressed */
 	u8 last[E5KP_COLS];		/* previous raw scan, for debouncing */
 };
+
+static void e5kp_cols_dir(struct e5kp *kp, bool out)
+{
+	int k;
+
+	for (k = 0; k < 2; k++)
+		writel(kp->col_mask[k], kp->gpio +
+			       (out ? GPIO_DIR_OUT(k) : GPIO_DIR_IN(k)));
+}
 
 static void e5kp_cols_level(struct e5kp *kp, bool high)
 {
@@ -103,6 +123,21 @@ static void e5kp_scan(struct e5kp *kp, u8 *cols)
 	/* at rest all columns are low: any key pulls its row down */
 	if (!e5kp_rows(kp))
 		return;
+
+	if (hiz) {
+		/* columns keep their low output latch, only the direction moves */
+		e5kp_cols_dir(kp, false);
+		for (c = 0; c < E5KP_COLS; c++) {
+			void __iomem *g = kp->gpio;
+
+			writel(kp->col_bit[c], g + GPIO_DIR_OUT(kp->col_bank[c]));
+			udelay(col_delay_us);
+			cols[c] = e5kp_rows(kp);
+			writel(kp->col_bit[c], g + GPIO_DIR_IN(kp->col_bank[c]));
+		}
+		e5kp_cols_dir(kp, true);
+		return;
+	}
 
 	for (c = 0; c < E5KP_COLS; c++) {
 		e5kp_cols_level(kp, true);

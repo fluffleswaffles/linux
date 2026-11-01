@@ -770,6 +770,13 @@ config SPI_OMAP_UWIRE
 	help
 	  This hooks up to the MicroWire controller on OMAP1 chips.
 
+config SPI_RAPUYAMA_E5
+	tristate "Nokia E5-00 RapuYama SPI2 controller"
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	help
+	  Polled PIO driver for the SPI2 block of the Nokia E5-00 RapuYama
+	  ASIC, the bus of its TI WL1251 wlan chip.
+
 config SPI_OMAP24XX
 	tristate "McSPI driver for OMAP"
 	depends on ARCH_OMAP2PLUS || ARCH_K3 || COMPILE_TEST

@@ -16,7 +16,11 @@
  *   EHwClkI2C1 (used by i2c0.dll), 0x1f = EHwClkBB38M4AnaClk1 (bt uart).
  *
  * Gates the firmware drives through other means (gpio driven clocks, the
- * irq driven usb power domain, plain software ones) are left out. The gate
+ * irq driven usb power domain, plain software ones) are left out, except
+ * gate 0x02 (EHwClkExtSysClk, res 0x0b): the E5 power_resources enables it
+ * by writing 1 to phys 0x20020804 and disables it with 0 (0x800ab8f4/
+ * 0x800ab970), it is the WL1251 reference clock there. It is only modelled
+ * when the node has that reg as its second one. The gate
  * regs are never read (the firmware doesn't either), so the state at boot is
  * whatever symbian left. Resources needed by drivers that don't enable their
  * clock themselves (i2c-omap only reads the rate, earlycon) are critical.
@@ -41,6 +45,7 @@ struct ry_gate_desc {
 	u16 mask;
 	u8 pol;
 	bool settle;	/* power domain, give it time after switching on */
+	bool ext;	/* plain 1/0 reg outside the cgc (second reg of the node) */
 };
 
 /*
@@ -50,6 +55,7 @@ struct ry_gate_desc {
  * 0x20033190. 0x17 is the RFBI/ViSSI clock the gfx dma needs
  */
 static const struct ry_gate_desc ry_gates[RY_GATE_MAX] = {
+	[0x02] = { .ext = true },
 	[0x06] = { 0x1d0, 0x0010, 1 },
 	[0x07] = { 0x1d0, 0x0040, 1 },
 	[0x08] = { 0x1d0, 0x0080, 1 },
@@ -142,6 +148,7 @@ static const struct ry_res_desc ry_res[] = {
 struct ry_clk {
 	struct clk_hw hw;
 	void __iomem *base;
+	void __iomem *ext;	/* optional, NULL without the second reg */
 	const struct ry_res_desc *res;
 };
 
@@ -149,16 +156,24 @@ static DEFINE_SPINLOCK(ry_cgc_lock);
 
 #define to_ry_clk(_hw) container_of(_hw, struct ry_clk, hw)
 
-static bool ry_gate_known(u8 g)
+static bool ry_gate_known(struct ry_clk *c, u8 g)
 {
-	return g && g < RY_GATE_MAX && ry_gates[g].mask;
+	if (!g || g >= RY_GATE_MAX)
+		return false;
+	if (ry_gates[g].ext)
+		return c->ext;
+	return ry_gates[g].mask;
 }
 
-static void ry_gate_write(void __iomem *base, u8 g, bool on)
+static void ry_gate_write(struct ry_clk *c, u8 g, bool on)
 {
 	const struct ry_gate_desc *d = &ry_gates[g];
 
-	writel(d->mask, base + d->reg + (on == d->pol ? RY_CGC_SET : RY_CGC_CLR));
+	if (d->ext)
+		writel(on, c->ext);
+	else
+		writel(d->mask, c->base + d->reg +
+		       (on == d->pol ? RY_CGC_SET : RY_CGC_CLR));
 }
 
 static int ry_clk_enable(struct clk_hw *hw)
@@ -170,10 +185,10 @@ static int ry_clk_enable(struct clk_hw *hw)
 	for (i = 0; i < 3; i++) {
 		u8 g = c->res->gate[i];
 
-		if (!ry_gate_known(g))
+		if (!ry_gate_known(c, g))
 			continue;
 		spin_lock_irqsave(&ry_cgc_lock, flags);
-		ry_gate_write(c->base, g, true);
+		ry_gate_write(c, g, true);
 		spin_unlock_irqrestore(&ry_cgc_lock, flags);
 		if (ry_gates[g].settle)
 			udelay(500);
@@ -189,8 +204,8 @@ static void ry_clk_disable(struct clk_hw *hw)
 
 	spin_lock_irqsave(&ry_cgc_lock, flags);
 	for (i = 2; i >= 0; i--)
-		if (ry_gate_known(c->res->gate[i]))
-			ry_gate_write(c->base, c->res->gate[i], false);
+		if (ry_gate_known(c, c->res->gate[i]))
+			ry_gate_write(c, c->res->gate[i], false);
 	spin_unlock_irqrestore(&ry_cgc_lock, flags);
 }
 
@@ -203,7 +218,7 @@ static void __init rapuyama_cgc_init(struct device_node *np)
 {
 	struct clk_hw_onecell_data *data;
 	struct clk_parent_data parent = { .index = 0 };
-	void __iomem *base;
+	void __iomem *base, *ext;
 	int i, ret;
 
 	base = of_iomap(np, 0);
@@ -211,6 +226,7 @@ static void __init rapuyama_cgc_init(struct device_node *np)
 		pr_err("rapuyama-cgc: can't map\n");
 		return;
 	}
+	ext = of_iomap(np, 1);
 
 	data = kzalloc(struct_size(data, hws, RY_RES_MAX), GFP_KERNEL);
 	if (!data)
@@ -231,6 +247,7 @@ static void __init rapuyama_cgc_init(struct device_node *np)
 			return;
 
 		c->base = base;
+		c->ext = ext;
 		c->res = r;
 		init.name = name;
 		init.ops = &ry_clk_ops;

@@ -101,6 +101,7 @@ spi-octeon-objs				:= spi-cavium.o spi-cavium-octeon.o
 obj-$(CONFIG_SPI_OCTEON)		+= spi-octeon.o
 obj-$(CONFIG_SPI_OMAP_UWIRE)		+= spi-omap-uwire.o
 obj-$(CONFIG_SPI_OMAP24XX)		+= spi-omap2-mcspi.o
+obj-$(CONFIG_SPI_RAPUYAMA_E5)		+= spi-rapuyama.o
 obj-$(CONFIG_SPI_TI_QSPI)		+= spi-ti-qspi.o
 obj-$(CONFIG_SPI_ORION)			+= spi-orion.o
 obj-$(CONFIG_SPI_PCI1XXXX)		+= spi-pci1xxxx.o

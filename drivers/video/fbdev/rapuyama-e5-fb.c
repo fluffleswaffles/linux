@@ -16,6 +16,12 @@
  * WRDISBV 0x51 = level 0..255. Exposed as /sys/class/backlight/panel; the
  * commands go out under push_lock so they never land inside a RAMWR stream.
  * The gazoo pwm (rapuyama-e5-bl.c) is not the screen.
+ *
+ * Blanking (fbcon's console blank, consoleblank= / setterm, or the fb0
+ * blank attribute) puts the panel to sleep: WRDISBV 0, display off 0x28,
+ * sleep in 0x10. Unblank: sleep out 0x11, 120 ms, display on 0x29, the
+ * brightness again and a full frame push. No pushes while asleep. 0x28 and
+ * 0x10 are standard DCS; d_display.ldd only uses 0x11/0x29 (wake side).
  */
 #include <linux/backlight.h>
 #include <linux/delay.h>
@@ -46,6 +52,10 @@
 #define DCS_CASET		0x2a
 #define DCS_PASET		0x2b
 #define DCS_RAMWR		0x2c
+#define DCS_SLPIN		0x10
+#define DCS_SLPOUT		0x11
+#define DCS_DISPOFF		0x28
+#define DCS_DISPON		0x29
 #define DCS_WRDISBV		0x51	/* display brightness */
 #define DCS_WRCTRLD		0x53	/* ctrl display */
 #define  DCS_CTRLD_ON		0x2c	/* BCTRL | DD | BL */
@@ -76,6 +86,7 @@ struct e5fb {
 	struct mutex push_lock;	/* one panel transfer at a time */
 	struct backlight_device *bl;
 	bool dead;		/* rfbi stuck busy: stop touching it */
+	bool asleep;		/* blanked: panel in sleep, no pushes */
 	bool timed;		/* first full frame time logged */
 	u32 pseudo_palette[16];
 };
@@ -127,7 +138,7 @@ static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 	u32 x, y;
 
 	mutex_lock(&fb->push_lock);
-	if (fb->dead)
+	if (fb->dead || fb->asleep)
 		goto out;
 	/* firmware order: PASET (rows) then CASET (columns), then RAMWR */
 	if (!e5fb_range(fb, DCS_PASET, y0, y1 - 1) ||
@@ -165,10 +176,13 @@ static int e5fb_bl_update(struct backlight_device *bl)
 	int ret = 0;
 
 	mutex_lock(&fb->push_lock);
+	if (fb->asleep)		/* sent again on unblank */
+		goto out;
 	if (fb->dead ||
 	    !e5fb_cmd(fb, DCS_WRCTRLD) || !e5fb_param(fb, DCS_CTRLD_ON) ||
 	    !e5fb_cmd(fb, DCS_WRDISBV) || !e5fb_param(fb, level))
 		ret = -EIO;
+out:
 	mutex_unlock(&fb->push_lock);
 	return ret;
 }
@@ -262,6 +276,47 @@ static void e5fb_deferred_io(struct fb_info *info, struct list_head *pagereflist
 	e5fb_work(&fb->work.work);
 }
 
+/* process context (console work, sysfs): sleeping is fine */
+static int e5fb_blank(int blank, struct fb_info *info)
+{
+	struct e5fb *fb = info->par;
+	bool sleep = blank != FB_BLANK_UNBLANK;
+	/* the set level: backlight_get_brightness() is 0 while the core's
+	 * fb notifier still has it blanked (it runs after this op) */
+	int level = fb->bl ? fb->bl->props.brightness : E5FB_BL_MAX;
+	int ret = 0;
+
+	mutex_lock(&fb->push_lock);
+	if (fb->dead) {
+		ret = -EIO;
+	} else if (sleep && !fb->asleep) {
+		if (!e5fb_cmd(fb, DCS_WRDISBV) || !e5fb_param(fb, 0) ||
+		    !e5fb_cmd(fb, DCS_DISPOFF) || !e5fb_cmd(fb, DCS_SLPIN))
+			ret = -EIO;
+		fb->asleep = true;
+		/* DCS: 120 ms before the next sleep out */
+		msleep(120);
+	} else if (!sleep && fb->asleep) {
+		fb->asleep = false;
+		if (!e5fb_cmd(fb, DCS_SLPOUT))
+			ret = -EIO;
+		msleep(120);
+		if (!ret && (!e5fb_cmd(fb, DCS_DISPON) ||
+			     !e5fb_cmd(fb, DCS_WRCTRLD) || !e5fb_param(fb, DCS_CTRLD_ON) ||
+			     !e5fb_cmd(fb, DCS_WRDISBV) || !e5fb_param(fb, level)))
+			ret = -EIO;
+	}
+	mutex_unlock(&fb->push_lock);
+	if (!sleep && !ret) {
+		/* the panel keeps its gram in sleep, but nothing was pushed since */
+		e5fb_damage(fb, 0, 0, E5FB_WIDTH, E5FB_HEIGHT);
+		schedule_delayed_work(&fb->work, 0);
+	}
+	if (ret)
+		dev_err(fb->dev, "%s failed\n", sleep ? "blank" : "unblank");
+	return ret;
+}
+
 static int e5fb_setcolreg(unsigned int regno, unsigned int red, unsigned int green,
 			  unsigned int blue, unsigned int transp, struct fb_info *info)
 {
@@ -278,6 +333,7 @@ static const struct fb_ops e5fb_ops = {
 	.owner		= THIS_MODULE,
 	FB_DEFAULT_DEFERRED_OPS(e5fb),
 	.fb_setcolreg	= e5fb_setcolreg,
+	.fb_blank	= e5fb_blank,
 };
 
 static int e5fb_probe(struct platform_device *pdev)

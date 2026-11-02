@@ -73,7 +73,9 @@ static int __init rapuyama_idle_init(void){
 	phys_addr_t phys;
 	int ret;
 
-	if(!of_machine_is_compatible("nokia,e6")){return 0;}
+	/* E5-00: same shallow WFI in its power.dll (WFI 0x8011619c, constrained
+	 * write 8 -> 0x20033144 at 0x801177e0), same L220 */
+	if(!of_machine_is_compatible("nokia,e6") && !of_machine_is_compatible("nokia,e5")){return 0;}
 	debugfs_create_file("rapuyama-idle", 0444, NULL, NULL, &rapuyama_idle_fops);
 	if(!requested){return 0;}
 	clock=ioremap(0x20033000, 0x200);

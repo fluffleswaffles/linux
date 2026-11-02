@@ -7,9 +7,11 @@
  *   ch 0: 0x257f00 = dev 2 reg 5 bits 14:8 (+ mode bits 4 and 0)
  *   ch 1: 0x2a007f = dev 2 reg 0xa bits 6:0 (+ mode bit 8)
  * the screen is not on these (P1 run: pwm0 changed, the screen did not; the
- * screen is the panel DCS backlight in rapuyama-e5-fb.c). pwm0 is probably
- * the key light, pwm1 (0 at handoff) unknown. only the pwm field is
- * written; the mode bits stay as symbian left them
+ * screen is the panel DCS backlight in rapuyama-e5-fb.c). pwm0 = keyboard
+ * light (seen on the device: 0 off, 10 dim, 127 full); pwm1 (0 at handoff)
+ * lights nothing visible. only the pwm field is written; the mode bits stay
+ * as symbian left them. with no fb tied to them, the backlight core blanks
+ * both together with fb0 (screen off = key light off)
  */
 #include <linux/backlight.h>
 #include <linux/module.h>

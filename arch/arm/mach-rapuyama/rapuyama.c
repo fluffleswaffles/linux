@@ -612,6 +612,7 @@ static const struct {
 	size_t size;
 } rapuyama_shm[] = {
 	{ 0x11525000, 0x2000 },
+	{ 0x10480000, 0x40c000 },
 	{ 0x1f8b0000, 0x44d000 },
 	{ 0x1ffe0000, 0x20000 },
 };

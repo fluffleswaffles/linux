@@ -668,4 +668,13 @@ config NETDEV_LEGACY_INIT
 	  Drivers that call netdev_boot_setup_check() should select this
 	  symbol, everything else no longer needs it.
 
+config RAPUYAMA_ISI
+	tristate "Nokia RapuYama ISI userspace transport"
+	depends on PHONET
+	help
+	  Provides a Phonet network interface and a packet endpoint for a
+	  userspace RapuYama modem firmware runtime. The endpoint converts
+	  Phonet lengths to the firmware's little endian ISI format.
+	  This transport does not access modem hardware or start its firmware.
+
 endif # NETDEVICES

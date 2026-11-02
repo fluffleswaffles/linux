@@ -1034,6 +1034,14 @@ choice
 
 	config VMSPLIT_3G
 		bool "3G/1G user/kernel split"
+	config VMSPLIT_3G25
+		bool "3.25G/0.75G user/kernel split (RapuYama firmware runtime)"
+		depends on ARCH_RAPUYAMA && !ARM_LPAE && !KASAN
+		help
+		  Keeps the original RapuYama firmware virtual addresses below
+		  TASK_SIZE so an isolated userspace runtime can map its private
+		  firmware images without rewriting pointers inside packet data.
+		  This leaves enough linear mapping space for the E6's 256 MiB.
 	config VMSPLIT_3G_OPT
 		depends on !ARM_LPAE
 		bool "3G/1G user/kernel split (for full 1G low memory)"
@@ -1049,6 +1057,7 @@ config PAGE_OFFSET
 	default 0x40000000 if VMSPLIT_1G
 	default 0x80000000 if VMSPLIT_2G
 	default 0xB0000000 if VMSPLIT_3G_OPT
+	default 0xD0000000 if VMSPLIT_3G25
 	default 0xC0000000
 
 config KASAN_SHADOW_OFFSET

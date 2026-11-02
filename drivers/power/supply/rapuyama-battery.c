@@ -13,6 +13,14 @@
  *   hw 9  charger voltage  0 without a charger, ~248 on usb
  *
  * the optional charger phandle supplies charging status
+ *
+ * E5-00 ("nokia,rapuyama-e5-battery"): same isasw em stack, same hw_ad
+ * channel table (0xc66775d8) and measurement switch (0xc6333424); its
+ * scaler 0xc6334294 run on the E5's own calibration (data 0xc682ac5c, xor
+ * 0xaa backup at 0xc682ae9c matches) gives
+ *
+ *   hw 8  battery voltage  mV = 2.04825 * raw + 2674.4 (within 2 mV)
+ *   hw 2  battery ntc      kelvin, e5_btemp_k below
  */
 #include <linux/devm-helpers.h>
 #include <linux/kernel.h>
@@ -40,6 +48,42 @@ static const u16 btemp_k[] = {
 	248, 245, 243, 240, 236, 232, 226, 217, 173,
 };
 
+static const u16 e5_btemp_k[] = {
+	0, 383, 365, 353, 345, 338, 333, 329, 325, 322, 319, 316, 313, 311,
+	309, 307, 305, 303, 301, 299, 298, 296, 295, 293, 292, 290, 289, 288,
+	286, 285, 284, 283, 281, 280, 279, 278, 276, 275, 274, 273, 272, 270,
+	269, 268, 267, 265, 264, 263, 261, 260, 258, 257, 255, 253, 251, 250,
+	247, 245, 243, 240, 236, 232, 226, 217, 181,
+};
+
+/*
+ * vbat mV = (raw * mul + add) / 10000, ntc kelvin per raw / 16.
+ * no_charging: linux never charges this battery (E5: the bq2415x is not
+ * programmed, charging stays in symbian), so a plugged cable is not a
+ * reason to let the percentage rise: it only follows the voltage down, and
+ * catches up in bigger steps when it is more than 5 % off (start value read right
+ * after symbian charged, voltage still raised)
+ */
+struct ry_bat_cal {
+	u32 vbat_mul, vbat_add;
+	bool no_charging;
+	const u16 *btemp_k;
+	unsigned int btemp_n;
+};
+
+static const struct ry_bat_cal e6_cal = {
+	.vbat_mul = 20637, .vbat_add = 27272000,
+	.btemp_k = btemp_k, .btemp_n = ARRAY_SIZE(btemp_k),
+};
+
+static const struct ry_bat_cal e5_cal = {
+	.vbat_mul = 20483, .vbat_add = 26744277,
+	.no_charging = true,
+	.btemp_k = e5_btemp_k, .btemp_n = ARRAY_SIZE(e5_btemp_k),
+};
+
+static const struct ry_bat_cal *cal = &e6_cal;
+
 /* rough open circuit voltage curve of a li-ion cell, mV -> % */
 static const struct {
 	u16 mv;
@@ -62,8 +106,7 @@ static int ry_bat_vbat_mv(int *mv)
 			return ret;
 		sum += raw;
 	}
-	/* 2.0637 mV per step + 2727.2 mV, in 1/10000 mV */
-	*mv = (sum * 20637 / VBAT_SAMPLES + 27272000) / 10000;
+	*mv = (sum * cal->vbat_mul / VBAT_SAMPLES + cal->vbat_add) / 10000;
 	return 0;
 }
 
@@ -82,11 +125,11 @@ static int ry_bat_temp(int *dc)
 		return -ENODATA;
 	i = raw / 16;
 	f = raw % 16;
-	if (i + 1 >= ARRAY_SIZE(btemp_k)) {
-		k10 = btemp_k[ARRAY_SIZE(btemp_k) - 1] * 10;
+	if (i + 1 >= cal->btemp_n) {
+		k10 = cal->btemp_k[cal->btemp_n - 1] * 10;
 	} else {
-		k10 = btemp_k[i] * 10 -
-		      ((int)btemp_k[i] - btemp_k[i + 1]) * 10 * (int)f / 16;
+		k10 = cal->btemp_k[i] * 10 -
+		      ((int)cal->btemp_k[i] - cal->btemp_k[i + 1]) * 10 * (int)f / 16;
 	}
 	*dc = k10 - 2732;
 	return 0;
@@ -133,6 +176,25 @@ static void ry_bat_track(struct ry_bat *rb)
 		return;
 	rb->mv16 += mv - rb->mv16 / 16;
 	want = ry_bat_capacity(rb->mv16 / 16);
+	if (cal->no_charging) {
+		/* more than 5 % off: close half the gap now, no hold */
+		if (rb->pct - want > 5) {
+			rb->pct -= (rb->pct - want) / 2;
+			rb->hold = PCT_HOLD;
+			power_supply_changed(rb->bat);
+			return;
+		}
+		if (rb->hold > 0) {
+			rb->hold--;
+			return;
+		}
+		if (want < rb->pct) {
+			rb->pct--;
+			rb->hold = PCT_HOLD;
+			power_supply_changed(rb->bat);
+		}
+		return;
+	}
 	if (rb->hold > 0) {
 		rb->hold--;
 		return;
@@ -261,6 +323,7 @@ static int ry_bat_probe(struct platform_device *pdev)
 	rb = devm_kzalloc(&pdev->dev, sizeof(*rb), GFP_KERNEL);
 	if (!rb)
 		return -ENOMEM;
+	cal = of_device_get_match_data(&pdev->dev);
 	ret = ry_bat_vbat_mv(&mv);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "no pmic adc\n");
@@ -292,7 +355,8 @@ static int ry_bat_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id ry_bat_of_match[] = {
-	{ .compatible = "nokia,rapuyama-battery" },
+	{ .compatible = "nokia,rapuyama-battery", .data = &e6_cal },
+	{ .compatible = "nokia,rapuyama-e5-battery", .data = &e5_cal },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ry_bat_of_match);

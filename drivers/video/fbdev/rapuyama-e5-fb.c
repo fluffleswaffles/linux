@@ -10,7 +10,14 @@
  * (ROM 0x801820a8). DISPC is not touched, RFBI is not reset or reprogrammed.
  * Measured on the device (D2, devmem): PASET = rows, CASET = columns, origin
  * top left, window offsets 0.
+ *
+ * Screen brightness is the panel's own DCS backlight control (P1, tried by
+ * hand on the device): WRCTRLD 0x53 = 0x2c (BCTRL | DD | BL on), then
+ * WRDISBV 0x51 = level 0..255. Exposed as /sys/class/backlight/panel; the
+ * commands go out under push_lock so they never land inside a RAMWR stream.
+ * The gazoo pwm (rapuyama-e5-bl.c) is not the screen.
  */
+#include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/fb.h>
 #include <linux/io.h>
@@ -39,6 +46,11 @@
 #define DCS_CASET		0x2a
 #define DCS_PASET		0x2b
 #define DCS_RAMWR		0x2c
+#define DCS_WRDISBV		0x51	/* display brightness */
+#define DCS_WRCTRLD		0x53	/* ctrl display */
+#define  DCS_CTRLD_ON		0x2c	/* BCTRL | DD | BL */
+
+#define E5FB_BL_MAX		255
 
 #define E5FB_BUSY_LOOPS		100000
 
@@ -62,6 +74,7 @@ struct e5fb {
 	struct delayed_work work;
 
 	struct mutex push_lock;	/* one panel transfer at a time */
+	struct backlight_device *bl;
 	bool dead;		/* rfbi stuck busy: stop touching it */
 	bool timed;		/* first full frame time logged */
 	u32 pseudo_palette[16];
@@ -144,6 +157,25 @@ static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 out:
 	mutex_unlock(&fb->push_lock);
 }
+
+static int e5fb_bl_update(struct backlight_device *bl)
+{
+	struct e5fb *fb = bl_get_data(bl);
+	int level = backlight_get_brightness(bl);
+	int ret = 0;
+
+	mutex_lock(&fb->push_lock);
+	if (fb->dead ||
+	    !e5fb_cmd(fb, DCS_WRCTRLD) || !e5fb_param(fb, DCS_CTRLD_ON) ||
+	    !e5fb_cmd(fb, DCS_WRDISBV) || !e5fb_param(fb, level))
+		ret = -EIO;
+	mutex_unlock(&fb->push_lock);
+	return ret;
+}
+
+static const struct backlight_ops e5fb_bl_ops = {
+	.update_status	= e5fb_bl_update,
+};
 
 static void e5fb_damage(struct e5fb *fb, u32 x, u32 y, u32 w, u32 h)
 {
@@ -251,6 +283,11 @@ static const struct fb_ops e5fb_ops = {
 static int e5fb_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct backlight_properties props = {
+		.type		= BACKLIGHT_RAW,
+		.max_brightness	= E5FB_BL_MAX,
+		.brightness	= E5FB_BL_MAX,
+	};
 	struct fb_deferred_io *defio;
 	struct fb_info *info;
 	struct e5fb *fb;
@@ -324,14 +361,25 @@ static int e5fb_probe(struct platform_device *pdev)
 		goto err_defio;
 	}
 
+	/* the panel level symbian left can't be read back: start at full */
+	fb->bl = backlight_device_register("panel", dev, fb, &e5fb_bl_ops, &props);
+	if (IS_ERR(fb->bl)) {
+		dev_warn(dev, "no backlight device (%pe)\n", fb->bl);
+		fb->bl = NULL;
+	} else {
+		backlight_update_status(fb->bl);
+	}
+
 	ret = register_framebuffer(info);
 	if (ret)
-		goto err_defio;
+		goto err_bl;
 
 	dev_info(dev, "fb%d: %ux%u xrgb8888, rfbi cpu path\n", info->node,
 		 E5FB_WIDTH, E5FB_HEIGHT);
 	return 0;
 
+err_bl:
+	backlight_device_unregister(fb->bl);
 err_defio:
 	fb_deferred_io_cleanup(info);
 err_vfree:
@@ -347,6 +395,7 @@ static void e5fb_remove(struct platform_device *pdev)
 	struct fb_info *info = fb->info;
 
 	unregister_framebuffer(info);
+	backlight_device_unregister(fb->bl);
 	cancel_delayed_work_sync(&fb->work);
 	fb_deferred_io_cleanup(info);
 	vfree(fb->vmem);

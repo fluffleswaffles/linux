@@ -31,8 +31,8 @@
  *   0x18 enabled mask                               0x20 write bits -> ack
  *   0x28 / 0x2c write bits -> edge / level          0x34 / 0x38 polarity
  *
- * Which of 0x34/0x38 is high/rising is a guess (egpio takes 1 -> 0x38,
- * 2 -> 0x34 and the callers don't tell), check it on hw.
+ * 0x34 = high/rising, 0x38 = low/falling: checked on the E5, the active
+ * high wl1251 irq (gpio 73) only fires with 0x34.
  */
 
 #include <linux/bitops.h>
@@ -64,8 +64,8 @@
 #define RY_IRQ_ACK	0x20
 #define RY_IRQ_EDGE	0x28
 #define RY_IRQ_LEVEL	0x2c
-#define RY_IRQ_POL_LO	0x34	/* guess */
-#define RY_IRQ_POL_HI	0x38	/* guess */
+#define RY_IRQ_POL_HI	0x34	/* checked on the E5 (wl1251, gpio 73) */
+#define RY_IRQ_POL_LO	0x38
 
 /* gpio offset -> main intc line, from the egpio pin table */
 static const struct {

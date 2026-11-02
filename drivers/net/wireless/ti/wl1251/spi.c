@@ -235,6 +235,7 @@ static int wl1251_spi_probe(struct spi_device *spi)
 	struct ieee80211_hw *hw;
 	struct wl1251_spi *wl_spi;
 	struct wl1251 *wl;
+	unsigned int irq_type;
 	int ret;
 
 	if (!np)
@@ -296,7 +297,15 @@ static int wl1251_spi_probe(struct spi_device *spi)
 		goto out_free;
 	}
 
-	irq_set_irq_type(wl->irq, IRQ_TYPE_EDGE_RISING);
+	/*
+	 * Keep an edge type from the firmware node (the handler only queues
+	 * work, so a level type would storm), default to rising.
+	 */
+	irq_type = irq_get_trigger_type(wl->irq) & IRQ_TYPE_EDGE_BOTH;
+	if (!irq_type)
+		irq_type = IRQ_TYPE_EDGE_RISING;
+	irq_set_irq_type(wl->irq, irq_type);
+	wl1251_info("irq %d trigger type %u", wl->irq, irq_type);
 
 	wl->vio = devm_regulator_get(&spi->dev, "vio");
 	if (IS_ERR(wl->vio)) {

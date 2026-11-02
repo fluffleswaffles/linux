@@ -205,6 +205,27 @@ int rapuyama_pmic_adc(unsigned int ch, u16 *raw)
 }
 EXPORT_SYMBOL_GPL(rapuyama_pmic_adc);
 
+/* locked read-modify-write of one pmic register, for the E5 light pwm */
+int rapuyama_pmic_update(u32 dev, u32 reg, u16 mask, u16 val, u16 *old)
+{
+	struct rapuyama_wdt *rw = READ_ONCE(rapuyama_pmic);
+	unsigned long flags;
+	u16 v;
+	int ret;
+
+	if (!rw)
+		return -EPROBE_DEFER;
+	spin_lock_irqsave(&rw->lock, flags);
+	ret = __rapuyama_cbus_read(rw, dev, reg, &v);
+	if (old && !ret)
+		*old = v;
+	if (!ret && mask && (v & mask) != (val & mask))
+		ret = __rapuyama_cbus_write(rw, dev, reg, (v & ~mask) | (val & mask));
+	spin_unlock_irqrestore(&rw->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rapuyama_pmic_update);
+
 /* all hw channels raw, to tell which is which (vbat, btemp, bsi, vchar) */
 static ssize_t adc_show(struct device *dev, struct device_attribute *attr,
 			char *buf)

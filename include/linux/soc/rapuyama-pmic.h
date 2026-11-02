@@ -6,5 +6,6 @@
 
 /* gazoo pmic adc, raw 10 bit, hw channel 0..18 (drivers/watchdog/rapuyama_wdt.c) */
 int rapuyama_pmic_adc(unsigned int ch, u16 *raw);
+int rapuyama_pmic_update(u32 dev, u32 reg, u16 mask, u16 val, u16 *old);
 
 #endif

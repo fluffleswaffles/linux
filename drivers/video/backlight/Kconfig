@@ -490,6 +490,12 @@ config BACKLIGHT_LED
 	  If you have a LCD backlight adjustable by LED class driver, say Y
 	  to enable this driver.
 
+config BACKLIGHT_RAPUYAMA_E5
+	tristate "Nokia E5-00 gazoo light pwm"
+	depends on RAPUYAMA_WATCHDOG
+	help
+	  Display / keyboard light pwm on the gazoo pmic of the Nokia E5-00.
+
 endif # BACKLIGHT_CLASS_DEVICE
 
 endmenu

@@ -21,6 +21,9 @@
  *
  *   hw 8  battery voltage  mV = 2.04825 * raw + 2674.4 (within 2 mV)
  *   hw 2  battery ntc      kelvin, e5_btemp_k below
+ *
+ * and its battery monitor (em_batmon5.c) gives the E5 capacity curve and
+ * the low battery poweroff, see e5_ocv and e5_cal.off_mv
  */
 #include <linux/devm-helpers.h>
 #include <linux/kernel.h>
@@ -29,6 +32,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
+#include <linux/reboot.h>
 #include <linux/soc/rapuyama-pmic.h>
 #include <linux/soc/rapuyama-usb.h>
 #include <linux/workqueue.h>
@@ -64,35 +68,62 @@ static const u16 e5_btemp_k[] = {
  * catches up in bigger steps when it is more than 5 % off (start value read right
  * after symbian charged, voltage still raised)
  */
+struct ry_ocv {
+	u16 mv;
+	u8 pct;
+};
+
+/* rough open circuit voltage curve of a li-ion cell, mV -> % */
+static const struct ry_ocv ocv[] = {
+	{ 3300, 0 }, { 3500, 5 }, { 3600, 10 }, { 3700, 30 }, { 3750, 45 },
+	{ 3800, 55 }, { 3850, 65 }, { 3900, 72 }, { 4000, 85 }, { 4100, 95 },
+	{ 4200, 100 },
+};
+
+/*
+ * E5 isasw em_batmon5.c: the battery table at 0xc6666770 (copied into the
+ * live monitor state at 0xc682b328, same values there), 19 x {used mAh, mV}
+ * from 0 mAh at 4179 mV to 1052 mAh at 3100 mV (BL-4D, 1200 mAh nominal,
+ * 0xc66667c0). % = 100 * (1052 - used) / 1052, rounded
+ */
+static const struct ry_ocv e5_ocv[] = {
+	{ 3240, 0 }, { 3319, 1 }, { 3395, 1 }, { 3479, 2 }, { 3566, 3 },
+	{ 3636, 5 }, { 3662, 6 }, { 3681, 13 }, { 3716, 17 }, { 3750, 24 },
+	{ 3776, 38 }, { 3816, 53 }, { 3853, 58 }, { 3948, 74 }, { 4052, 88 },
+	{ 4158, 99 }, { 4179, 100 },
+};
+
+/*
+ * off_mv: power off once the averaged voltage stays below it for OFF_POLLS
+ * polls (0 = never). E5: 3300 mV = em_batmon5's low limit (default
+ * 0xce4 at 0xc6335888, live 0xc682b1ae = 3300, setter 0xc6335f98 refuses
+ * anything lower); it also wants 3400 mV at boot (0xc6335a0e)
+ */
 struct ry_bat_cal {
 	u32 vbat_mul, vbat_add;
 	bool no_charging;
 	const u16 *btemp_k;
 	unsigned int btemp_n;
+	const struct ry_ocv *ocv;
+	unsigned int ocv_n;
+	u16 off_mv;
 };
 
 static const struct ry_bat_cal e6_cal = {
 	.vbat_mul = 20637, .vbat_add = 27272000,
 	.btemp_k = btemp_k, .btemp_n = ARRAY_SIZE(btemp_k),
+	.ocv = ocv, .ocv_n = ARRAY_SIZE(ocv),
 };
 
 static const struct ry_bat_cal e5_cal = {
 	.vbat_mul = 20483, .vbat_add = 26744277,
 	.no_charging = true,
 	.btemp_k = e5_btemp_k, .btemp_n = ARRAY_SIZE(e5_btemp_k),
+	.ocv = e5_ocv, .ocv_n = ARRAY_SIZE(e5_ocv),
+	.off_mv = 3300,
 };
 
 static const struct ry_bat_cal *cal = &e6_cal;
-
-/* rough open circuit voltage curve of a li-ion cell, mV -> % */
-static const struct {
-	u16 mv;
-	u8 pct;
-} ocv[] = {
-	{ 3300, 0 }, { 3500, 5 }, { 3600, 10 }, { 3700, 30 }, { 3750, 45 },
-	{ 3800, 55 }, { 3850, 65 }, { 3900, 72 }, { 4000, 85 }, { 4100, 95 },
-	{ 4200, 100 },
-};
 
 static int ry_bat_vbat_mv(int *mv)
 {
@@ -146,11 +177,12 @@ static int ry_bat_charger(void)
 
 static int ry_bat_capacity(int mv)
 {
+	const struct ry_ocv *ocv = cal->ocv;
 	unsigned int i;
 
 	if (mv <= ocv[0].mv)
 		return 0;
-	for (i = 1; i < ARRAY_SIZE(ocv); i++)
+	for (i = 1; i < cal->ocv_n; i++)
 		if (mv < ocv[i].mv)
 			return ocv[i - 1].pct + (ocv[i].pct - ocv[i - 1].pct) *
 			       (mv - ocv[i - 1].mv) / (ocv[i].mv - ocv[i - 1].mv);
@@ -158,6 +190,7 @@ static int ry_bat_capacity(int mv)
 }
 
 #define PCT_HOLD	60
+#define OFF_POLLS	30	/* ~30 s below off_mv */
 
 struct ry_bat {
 	struct power_supply *bat, *usb;
@@ -165,6 +198,7 @@ struct ry_bat {
 	int charger;
 	int mv16;	/* vbat averaged over ~16 s, mV * 16 */
 	int pct, hold;
+	int low;	/* polls in a row below cal->off_mv */
 };
 
 
@@ -175,6 +209,15 @@ static void ry_bat_track(struct ry_bat *rb)
 	if (ry_bat_vbat_mv(&mv))
 		return;
 	rb->mv16 += mv - rb->mv16 / 16;
+	if (cal->off_mv && rb->mv16 / 16 < cal->off_mv) {
+		if (++rb->low == OFF_POLLS) {
+			dev_crit(&rb->bat->dev, "battery empty (%d mV < %u mV), powering off\n",
+				 rb->mv16 / 16, cal->off_mv);
+			orderly_poweroff(true);
+		}
+	} else {
+		rb->low = 0;
+	}
 	want = ry_bat_capacity(rb->mv16 / 16);
 	if (cal->no_charging) {
 		/* more than 5 % off: close half the gap now, no hold */

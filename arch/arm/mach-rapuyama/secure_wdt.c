@@ -284,12 +284,20 @@ static void swd_ping(struct work_struct *work)
 
 	swd_calls++;
 	timeout = swd->response & 0xffff;
-	pr_info("rapuyama-swd: call %u stage %u transport %d result %u timeout %u token %u\n",
-		swd_calls, swd->stage, (s32)swd->transport, swd->result,
-		timeout, swd->response >> 16);
+	/* only the first pet goes to the console, the rest are routine */
+	if (swd_calls == 1)
+		pr_info("rapuyama-swd: call %u stage %u transport %d result %u timeout %u token %u\n",
+			swd_calls, swd->stage, (s32)swd->transport,
+			swd->result, timeout, swd->response >> 16);
+	else
+		pr_debug("rapuyama-swd: call %u stage %u transport %d result %u timeout %u token %u\n",
+			 swd_calls, swd->stage, (s32)swd->transport,
+			 swd->result, timeout, swd->response >> 16);
 	if (swd->stage != 60 || swd->transport != 1 || swd->result != 1 ||
 	    timeout <= 30 || timeout > 3600) {
-		pr_err("rapuyama-swd: secure pet failed, stopping\n");
+		pr_err("rapuyama-swd: secure pet failed (call %u stage %u transport %d result %u timeout %u)\n",
+		       swd_calls, swd->stage, (s32)swd->transport,
+		       swd->result, timeout);
 		return;
 	}
 	swd->token = swd->response >> 16;

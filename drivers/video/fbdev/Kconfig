@@ -1794,7 +1794,9 @@ config FB_RAPUYAMA_E5
 	  Framebuffer for the Nokia E5-00 command-mode panel behind the
 	  OMAP2-style RFBI that Symbian leaves set up. A shadow buffer is
 	  pushed to the panel by the CPU (DCS window + RAMWR, three bytes
-	  per pixel). Usable with fbcon. Screen brightness (panel DCS
+	  per pixel) or, by default when the dt has the DISPC reg and clock,
+	  by DISPC + RFBI DMA (rapuyama_e5_fb.dma=0 = CPU only). Usable
+	  with fbcon. Screen brightness (panel DCS
 	  0x51) is /sys/class/backlight/panel.
 
 config FB_SIMPLE

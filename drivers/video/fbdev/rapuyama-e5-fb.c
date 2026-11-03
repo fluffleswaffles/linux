@@ -4,10 +4,26 @@
  * Symbian leaves set up for a MIPI DCS command-mode panel (320x240, 8-bit
  * bus, RGB888 as three bytes per pixel).
  *
- * CPU path only: a shadow buffer in normal memory (XRGB8888) is pushed to the
+ * CPU path: a shadow buffer in normal memory (XRGB8888) is pushed to the
  * panel GRAM through RFBI CMD/PARAM writes (window PASET/CASET, RAMWR, then
  * R,G,B per pixel), the way d_display.ldd's fill-rectangle routine does it
- * (ROM 0x801820a8). DISPC is not touched, RFBI is not reset or reprogrammed.
+ * (ROM 0x801820a8). RFBI is not reset or reprogrammed.
+ *
+ * DMA path (default; dma=0 turns it off; needs the DISPC reg + clock): DISPC
+ * fetches the rectangle from the shadow buffer and feeds RFBI in stall mode,
+ * as d_display.ldd's push (ROM
+ * 0x80180498, DISPC part 0x801791d0) does: GFX_BA0 = rect start, GFX_POSITION
+ * 0, GFX_SIZE = SIZE_LCD = (h-1)<<16 | (w-1), GFX_ROW_INC = stride - w*4 + 1,
+ * GFX_PIXEL_INC 1, CONTROL |= GOLCD then |= LCDENABLE, 13 us, window +
+ * PIXEL_CNT = w*h, RAMWR, RFBI CONTROL |= ENABLE | ITE; done at DISPC
+ * FRAMEDONE (IRQSTATUS bit 0, polled here), then RFBI CONTROL &= ~0x11 (the
+ * firmware's stop, 0x8018060c). Symbian's DISPC setup is kept: stall mode,
+ * GFX format 8 (xRGB8888, = our shadow), 24 data lines. A timeout logs the
+ * registers and falls back to the CPU path for good. The DMA needs the
+ * ViSSI clock (power resource 0x18 = cgc gate 0x17), which Symbian leaves
+ * off when idle (registers still answer, DISPC never fetches): it is on only
+ * during a push, as in the firmware. Phone test: full frame 19.7 ms (CPU
+ * path 36-57 ms with the CPU busy throughout), console scroll twice as fast.
  * Measured on the device (D2, devmem): PASET = rows, CASET = columns, origin
  * top left, window offsets 0.
  *
@@ -24,9 +40,12 @@
  * 0x10 are standard DCS; d_display.ldd only uses 0x11/0x29 (wake side).
  */
 #include <linux/backlight.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/fb.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
@@ -45,8 +64,28 @@
 /* RFBI registers (OMAP2 layout, offsets used by d_display.ldd) */
 #define RFBI_SYSSTATUS		0x14
 #define  RFBI_SYSSTATUS_BUSY	BIT(8)
+#define RFBI_CONTROL		0x40
+#define  RFBI_CONTROL_ENABLE	BIT(0)
+#define  RFBI_CONTROL_ITE	BIT(4)	/* internal trigger, cleared by hw */
+#define RFBI_PIXEL_CNT		0x44
 #define RFBI_CMD		0x4c
 #define RFBI_PARAM		0x50
+
+/* DISPC registers (OMAP2 layout, offsets used by d_display.ldd) */
+#define DISPC_IRQSTATUS		0x18
+#define  DISPC_IRQ_FRAMEDONE	BIT(0)
+#define  DISPC_IRQ_GFXENDWIN	BIT(7)
+#define DISPC_CONTROL		0x40
+#define  DISPC_CONTROL_LCDENABLE	BIT(0)
+#define  DISPC_CONTROL_GOLCD	BIT(5)
+#define DISPC_SIZE_LCD		0x7c
+#define DISPC_GFX_BA0		0x80
+#define DISPC_GFX_POSITION	0x88
+#define DISPC_GFX_SIZE		0x8c
+#define DISPC_GFX_ROW_INC	0xac
+#define DISPC_GFX_PIXEL_INC	0xb0
+
+#define E5FB_DMA_TIMEOUT_US	200000
 
 /* MIPI DCS */
 #define DCS_CASET		0x2a
@@ -68,6 +107,10 @@ static bool busy_poll = true;
 module_param(busy_poll, bool, 0644);
 MODULE_PARM_DESC(busy_poll, "poll RFBI SYSSTATUS busy before every write (firmware behaviour, default on)");
 
+static bool dma = true;
+module_param(dma, bool, 0644);
+MODULE_PARM_DESC(dma, "push through DISPC + RFBI DMA instead of CPU writes (default on; needs the DISPC reg and clock in the dt)");
+
 static unsigned int refresh_ms = 40;
 module_param(refresh_ms, uint, 0644);
 MODULE_PARM_DESC(refresh_ms, "delay between a drawing op and the panel push in ms (default 40)");
@@ -75,8 +118,11 @@ MODULE_PARM_DESC(refresh_ms, "delay between a drawing op and the panel push in m
 struct e5fb {
 	struct device *dev;
 	void __iomem *rfbi;
+	void __iomem *dispc;	/* NULL: CPU path only */
+	struct clk *dma_clk;	/* gfx dma clock, on during a dma push */
 	struct fb_info *info;
 	u8 *vmem;
+	dma_addr_t vmem_dma;	/* valid when dispc is set */
 
 	/* pending damage, in pixels, x1/y1 exclusive; empty when x0 >= x1 */
 	spinlock_t dmg_lock;
@@ -87,7 +133,9 @@ struct e5fb {
 	struct backlight_device *bl;
 	bool dead;		/* rfbi stuck busy: stop touching it */
 	bool asleep;		/* blanked: panel in sleep, no pushes */
-	bool timed;		/* first full frame time logged */
+	bool dma_broken;	/* dma push timed out: CPU path from now on */
+	bool dma_seen;		/* first dma completion logged */
+	bool timed[2];		/* first full frame time logged, per path */
 	u32 pseudo_palette[16];
 };
 
@@ -131,20 +179,16 @@ static bool e5fb_range(struct e5fb *fb, u8 cmd, u16 start, u16 end)
 	       e5fb_param(fb, end >> 8) && e5fb_param(fb, end & 0xff);
 }
 
-/* push the rectangle [x0,x1) x [y0,y1) of the shadow buffer to the panel */
-static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
+/* CPU path, push_lock held */
+static void e5fb_push_cpu(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 {
-	ktime_t t0 = ktime_get();
 	u32 x, y;
 
-	mutex_lock(&fb->push_lock);
-	if (fb->dead || fb->asleep)
-		goto out;
 	/* firmware order: PASET (rows) then CASET (columns), then RAMWR */
 	if (!e5fb_range(fb, DCS_PASET, y0, y1 - 1) ||
 	    !e5fb_range(fb, DCS_CASET, x0, x1 - 1) ||
 	    !e5fb_cmd(fb, DCS_RAMWR))
-		goto out;
+		return;
 
 	for (y = y0; y < y1; y++) {
 		const u32 *p = (const u32 *)(fb->vmem + y * E5FB_STRIDE) + x0;
@@ -154,16 +198,108 @@ static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 
 			if (!e5fb_param(fb, v >> 16) || !e5fb_param(fb, v >> 8) ||
 			    !e5fb_param(fb, v))
-				goto out;
+				return;
 		}
 		cond_resched();
 	}
+}
 
-	if (!fb->timed && x0 == 0 && y0 == 0 &&
+static void e5fb_dma_regs(struct e5fb *fb, const char *why)
+{
+	dev_err(fb->dev, "dma %s: dispc irqstatus %#x control %#x, rfbi control %#x sysstatus %#x pixel_cnt %#x\n",
+		why, readl(fb->dispc + DISPC_IRQSTATUS),
+		readl(fb->dispc + DISPC_CONTROL),
+		readl(fb->rfbi + RFBI_CONTROL), readl(fb->rfbi + RFBI_SYSSTATUS),
+		readl(fb->rfbi + RFBI_PIXEL_CNT));
+}
+
+/* DMA path (d_display.ldd 0x80180498), push_lock held. false: not pushed */
+static bool e5fb_push_dma(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
+{
+	void __iomem *d = fb->dispc;
+	u32 w = x1 - x0, h = y1 - y0, size = (h - 1) << 16 | (w - 1);
+	u32 v;
+
+	if (readl(d + DISPC_CONTROL) & DISPC_CONTROL_LCDENABLE) {
+		e5fb_dma_regs(fb, "busy at start");
+		return false;
+	}
+	/* the cpu cache (fbcon, defio after page_mkclean) to ram */
+	if (clk_enable(fb->dma_clk)) {
+		fb->dma_broken = true;
+		dev_err(fb->dev, "dma clock enable failed, cpu path\n");
+		return false;
+	}
+	dma_sync_single_for_device(fb->dev, fb->vmem_dma + y0 * E5FB_STRIDE,
+				   h * E5FB_STRIDE, DMA_TO_DEVICE);
+	writel(DISPC_IRQ_FRAMEDONE | DISPC_IRQ_GFXENDWIN, d + DISPC_IRQSTATUS);
+
+	writel(fb->vmem_dma + y0 * E5FB_STRIDE + x0 * 4, d + DISPC_GFX_BA0);
+	writel(0, d + DISPC_GFX_POSITION);
+	writel(size, d + DISPC_GFX_SIZE);
+	writel(size, d + DISPC_SIZE_LCD);
+	writel(E5FB_STRIDE - w * 4 + 1, d + DISPC_GFX_ROW_INC);
+	writel(1, d + DISPC_GFX_PIXEL_INC);
+	writel(readl(d + DISPC_CONTROL) | DISPC_CONTROL_GOLCD, d + DISPC_CONTROL);
+	writel(readl(d + DISPC_CONTROL) | DISPC_CONTROL_LCDENABLE, d + DISPC_CONTROL);
+	udelay(13);
+
+	if (!e5fb_range(fb, DCS_PASET, y0, y1 - 1) ||
+	    !e5fb_range(fb, DCS_CASET, x0, x1 - 1) || !e5fb_wait(fb))
+		goto stop;
+	writel(w * h, fb->rfbi + RFBI_PIXEL_CNT);
+	if (!e5fb_cmd(fb, DCS_RAMWR) || !e5fb_wait(fb))
+		goto stop;
+	writel(readl(fb->rfbi + RFBI_CONTROL) | RFBI_CONTROL_ENABLE | RFBI_CONTROL_ITE,
+	       fb->rfbi + RFBI_CONTROL);
+
+	if (readl_poll_timeout(d + DISPC_IRQSTATUS, v, v & DISPC_IRQ_FRAMEDONE,
+			       1000, E5FB_DMA_TIMEOUT_US)) {
+		e5fb_dma_regs(fb, "timeout, back to the cpu path");
+		fb->dma_broken = true;
+		goto stop;
+	}
+	if (!fb->dma_seen) {	/* evidence for the first transfer */
+		fb->dma_seen = true;
+		dev_info(fb->dev, "dma done: dispc irqstatus %#x control %#x\n",
+			 v, readl(d + DISPC_CONTROL));
+	}
+	e5fb_wait(fb);
+	writel(DISPC_IRQ_FRAMEDONE | DISPC_IRQ_GFXENDWIN, d + DISPC_IRQSTATUS);
+stop:
+	writel(readl(fb->rfbi + RFBI_CONTROL) &
+	       ~(RFBI_CONTROL_ENABLE | RFBI_CONTROL_ITE), fb->rfbi + RFBI_CONTROL);
+	if (fb->dma_broken)
+		writel(readl(d + DISPC_CONTROL) & ~DISPC_CONTROL_LCDENABLE,
+		       d + DISPC_CONTROL);
+	clk_disable(fb->dma_clk);
+	return !fb->dma_broken && !fb->dead;
+}
+
+/* push the rectangle [x0,x1) x [y0,y1) of the shadow buffer to the panel */
+static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
+{
+	ktime_t t0 = ktime_get();
+	bool use_dma;
+
+	mutex_lock(&fb->push_lock);
+	if (fb->dead || fb->asleep)
+		goto out;
+	use_dma = dma && fb->dispc && !fb->dma_broken;
+	if (use_dma && !e5fb_push_dma(fb, x0, y0, x1, y1)) {
+		use_dma = false;
+		if (fb->dead)
+			goto out;
+	}
+	if (!use_dma)
+		e5fb_push_cpu(fb, x0, y0, x1, y1);
+
+	if (!fb->dead && !fb->timed[use_dma] && x0 == 0 && y0 == 0 &&
 	    x1 == E5FB_WIDTH && y1 == E5FB_HEIGHT) {
-		fb->timed = true;
-		dev_info(fb->dev, "full frame push %lld us (busy_poll %d)\n",
-			 ktime_us_delta(ktime_get(), t0), busy_poll);
+		fb->timed[use_dma] = true;
+		dev_info(fb->dev, "full frame push %lld us (%s, busy_poll %d)\n",
+			 ktime_us_delta(ktime_get(), t0),
+			 use_dma ? "dma" : "cpu", busy_poll);
 	}
 out:
 	mutex_unlock(&fb->push_lock);
@@ -336,6 +472,16 @@ static const struct fb_ops e5fb_ops = {
 	.fb_blank	= e5fb_blank,
 };
 
+static void e5fb_free_vmem(struct e5fb *fb)
+{
+	if (fb->dispc) {
+		dma_unmap_single(fb->dev, fb->vmem_dma, E5FB_SIZE, DMA_TO_DEVICE);
+		free_pages_exact(fb->vmem, PAGE_ALIGN(E5FB_SIZE));
+	} else {
+		vfree(fb->vmem);
+	}
+}
+
 static int e5fb_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -365,7 +511,46 @@ static int e5fb_probe(struct platform_device *pdev)
 		goto err_release;
 	}
 
-	fb->vmem = vzalloc(PAGE_ALIGN(E5FB_SIZE));
+	/* DISPC (2nd reg) is optional: without it the CPU path only */
+	if (platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
+		fb->dispc = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(fb->dispc)) {
+			ret = PTR_ERR(fb->dispc);
+			goto err_release;
+		}
+		/* gfx dma clock; without it (old dtb) the dma can't run */
+		fb->dma_clk = devm_clk_get_optional_prepared(dev, NULL);
+		if (IS_ERR(fb->dma_clk)) {
+			ret = PTR_ERR(fb->dma_clk);
+			goto err_release;
+		}
+		if (!fb->dma_clk) {
+			dev_warn(dev, "no dma clock in the dt, cpu path only\n");
+			fb->dispc = NULL;
+		}
+	}
+
+	if (fb->dispc) {
+		/* DISPC reads it: physically contiguous, cached + streaming sync */
+		fb->vmem = alloc_pages_exact(PAGE_ALIGN(E5FB_SIZE),
+					     GFP_KERNEL | __GFP_ZERO);
+		if (fb->vmem) {
+			fb->vmem_dma = dma_map_single(dev, fb->vmem, E5FB_SIZE,
+						      DMA_TO_DEVICE);
+			if (dma_mapping_error(dev, fb->vmem_dma)) {
+				free_pages_exact(fb->vmem, PAGE_ALIGN(E5FB_SIZE));
+				fb->vmem = NULL;
+			} else {
+				info->fix.smem_start = virt_to_phys(fb->vmem);
+			}
+		}
+		if (!fb->vmem) {
+			dev_warn(dev, "no contiguous buffer, cpu path only\n");
+			fb->dispc = NULL;
+		}
+	}
+	if (!fb->vmem)
+		fb->vmem = vzalloc(PAGE_ALIGN(E5FB_SIZE));
 	if (!fb->vmem) {
 		ret = -ENOMEM;
 		goto err_release;
@@ -430,8 +615,8 @@ static int e5fb_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_bl;
 
-	dev_info(dev, "fb%d: %ux%u xrgb8888, rfbi cpu path\n", info->node,
-		 E5FB_WIDTH, E5FB_HEIGHT);
+	dev_info(dev, "fb%d: %ux%u xrgb8888, rfbi cpu path%s\n", info->node,
+		 E5FB_WIDTH, E5FB_HEIGHT, fb->dispc ? " + dispc dma" : "");
 	return 0;
 
 err_bl:
@@ -439,7 +624,7 @@ err_bl:
 err_defio:
 	fb_deferred_io_cleanup(info);
 err_vfree:
-	vfree(fb->vmem);
+	e5fb_free_vmem(fb);
 err_release:
 	framebuffer_release(info);
 	return ret;
@@ -454,7 +639,7 @@ static void e5fb_remove(struct platform_device *pdev)
 	backlight_device_unregister(fb->bl);
 	cancel_delayed_work_sync(&fb->work);
 	fb_deferred_io_cleanup(info);
-	vfree(fb->vmem);
+	e5fb_free_vmem(fb);
 	framebuffer_release(info);
 }
 

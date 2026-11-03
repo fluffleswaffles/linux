@@ -111,9 +111,15 @@ static bool dma = true;
 module_param(dma, bool, 0644);
 MODULE_PARM_DESC(dma, "push through DISPC + RFBI DMA instead of CPU writes (default on; needs the DISPC reg and clock in the dt)");
 
-static unsigned int refresh_ms = 40;
+/*
+ * 10 ms (was 40): with the dma push a full frame costs the CPU about 1 ms,
+ * so a short delay doubles the visible frame rate while scrolling for ~3 %
+ * CPU (phone test: 2000-line scroll 1.15 -> 1.20 s, kernel CPU +0.03 s).
+ * On the CPU path a push is 36-57 ms of CPU: raise it there (dma=0).
+ */
+static unsigned int refresh_ms = 10;
 module_param(refresh_ms, uint, 0644);
-MODULE_PARM_DESC(refresh_ms, "delay between a drawing op and the panel push in ms (default 40)");
+MODULE_PARM_DESC(refresh_ms, "delay between a drawing op and the panel push in ms (default 10; mmap: set at probe)");
 
 struct e5fb {
 	struct device *dev;

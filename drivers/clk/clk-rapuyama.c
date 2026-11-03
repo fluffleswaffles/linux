@@ -36,8 +36,8 @@
 
 #define RY_CGC_SET	0x4
 #define RY_CGC_CLR	0x8
-#define RY_GATE_MAX	0x30
-#define RY_RES_MAX	0x3a
+#define RY_GATE_MAX	0x31
+#define RY_RES_MAX	0x3b
 
 /* cgc base = phys 0x20032f00 */
 struct ry_gate_desc {
@@ -96,6 +96,8 @@ static const struct ry_gate_desc ry_gates[RY_GATE_MAX] = {
 	[0x2b] = { 0x1e0, 0x0080, 1 },
 	[0x2c] = { 0x290, 0x0200, 1 },
 	[0x2d] = { 0x290, 0x0008, 1 },
+	/* not a firmware gate id: the E5 GDMA's second clock, see res 0x3a */
+	[0x30] = { 0x180, 0x0008, 1 },
 };
 
 struct ry_res_desc {
@@ -143,6 +145,12 @@ static const struct ry_res_desc ry_res[] = {
 	{ 0x33, { 0x2d } },			/* EHwClkEMC */
 	{ 0x38, { 0x2e, 0x1a } },		/* EHwClkBTExtSysClk */
 	{ 0x39, { 0x2f } },			/* EHwClkMemIf */
+	/*
+	 * not a firmware resource: the E5 GDMA. dma.dll asks for res 0x22
+	 * (gate 0x28) and ecust.dll also sets cgc+0x180 bit 3 at boot; with
+	 * either one off the GDMA reads all ones.
+	 */
+	{ 0x3a, { 0x28, 0x30 } },
 };
 
 struct ry_clk {

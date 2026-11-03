@@ -15,6 +15,16 @@
  * checksums every page of it that Symbian doesn't map, every 30 s for 10 min,
  * and logs the ones that change: something (modem dma?) still writing there.
  *
+ * e6.lowmem=2: keep only what can still be in use instead of every mapped
+ * page: the L2 tables, everything symbian's kernel core maps (va 0xc0000000
+ * ..0xc9ffffff and 0xfc000000 up: superpage, page directories and tables,
+ * kernel data, heap, stacks: the PA_SWD bridge runs symbian kernel code that
+ * reads them; releasing them killed the first secure call), all pages behind
+ * a table that also maps io or symbian-top (device windows), the va
+ * 0x90000000 table (the DSP window area on the E6) and the bridge's pages
+ * (secure_wdt.c). The rest are chunks (multimedia sections, d3/d4..), E5
+ * watch run: nothing wrote them for 10 min (modem idle).
+ *
  * e6.lowwatch=2 (with e6.lowmem=1, debug, changes nothing): print where every
  * L2 table of symbian's kernel L1 copy points (below/low/high/top/io) and
  * checksum the kept symbian pages instead, to find which of them are dead.
@@ -61,14 +71,15 @@ phys_addr_t rapuyama_vc_tx;
 EXPORT_SYMBOL(rapuyama_vc_tx);
 
 static DECLARE_BITMAP(ry_sym, RY_NPG);
-static bool ry_lowmem;
+static DECLARE_BITMAP(ry_keep, RY_NPG);	/* e6.lowmem=2: still needed */
+static unsigned int ry_lowmem;		/* 0 off, 1 keep mapped, 2 keep needed */
 static unsigned int ry_lowwatch;	/* 1: unmapped pages, 2: kept pages */
 static bool ry_walk_report;
 static phys_addr_t ry_kbase;
 
 static int __init ry_lowmem_param(char *s)
 {
-	return kstrtobool(s, &ry_lowmem);
+	return kstrtouint(s, 0, &ry_lowmem);
 }
 early_param("e6.lowmem", ry_lowmem_param);
 
@@ -83,11 +94,23 @@ static bool __init ry_is_ram(phys_addr_t pa)
 	return pa >= 0x10000000 && pa < RY_RAM_HI;
 }
 
-static void __init ry_mark(phys_addr_t pa, phys_addr_t len)
+static void __init ry_set(unsigned long *map, phys_addr_t pa, phys_addr_t len)
 {
 	for (; len; pa += PAGE_SIZE, len -= PAGE_SIZE)
 		if (pa >= RY_RAM_LO && pa < RY_RAM_HI)
-			__set_bit((pa - RY_RAM_LO) >> PAGE_SHIFT, ry_sym);
+			__set_bit((pa - RY_RAM_LO) >> PAGE_SHIFT, map);
+}
+
+static void __init ry_mark(phys_addr_t pa, phys_addr_t len)
+{
+	ry_set(ry_sym, pa, len);
+}
+
+/* secure_wdt.c: a page the PA_SWD bridge touches, below the kernel */
+void __init rapuyama_lowmem_keep(phys_addr_t pa)
+{
+	ry_set(ry_keep, pa & PAGE_MASK, PAGE_SIZE);
+	ry_set(ry_sym, pa & PAGE_MASK, PAGE_SIZE);
 }
 
 static const char *const ry_cls_name[] = { "below", "low", "high", "top", "io" };
@@ -106,6 +129,12 @@ static int __init ry_cls(phys_addr_t pa)
 	return 3;
 }
 
+/* e6.lowmem=2: symbian kernel core, read by the code the PA_SWD bridge runs */
+static bool __init ry_core_va(u32 va)
+{
+	return (va >= 0xc0000000 && va < 0xca000000) || va >= 0xfc000000;
+}
+
 static void __init ry_walk_l2(phys_addr_t tp, u32 va)
 {
 	unsigned int n[5] = { 0 };
@@ -114,6 +143,7 @@ static void __init ry_walk_l2(phys_addr_t tp, u32 va)
 	int j;
 
 	ry_mark(tp & PAGE_MASK, PAGE_SIZE);
+	ry_set(ry_keep, tp & PAGE_MASK, PAGE_SIZE);
 	l2 = early_memremap(tp, 0x400);
 	if (!l2)
 		return;
@@ -132,6 +162,15 @@ static void __init ry_walk_l2(phys_addr_t tp, u32 va)
 		lo = min(lo, pa);
 		hi = max(hi, pa);
 	}
+	/* device windows and the DSP area: keep every page of the table */
+	if (n[3] || n[4] || va == 0x90000000 || ry_core_va(va))
+		for (j = 0; j < 256; j++) {
+			e = l2[j];
+			if (e & 2)
+				ry_set(ry_keep, e & PAGE_MASK, PAGE_SIZE);
+			else if (e & 1)
+				ry_set(ry_keep, e & 0xffff0000, SZ_64K);
+		}
 	early_memunmap(l2, 0x400);
 	if (ry_walk_report)
 		pr_info("rapuyama: lowmap va %08x l2 %08x (%s): below %u low %u high %u top %u io %u, pa %08x..%08x\n",
@@ -154,6 +193,9 @@ static void __init ry_walk_l1(phys_addr_t l1pa)
 			ry_mark(d & 0xff000000, SZ_16M);
 		else if ((d & 3) == 2)
 			ry_mark(d & 0xfff00000, SZ_1M);
+		if ((d & 3) == 2 && ry_core_va((u32)i << 20))
+			ry_set(ry_keep, d & ((d & BIT(18)) ? 0xff000000 : 0xfff00000),
+			       (d & BIT(18)) ? SZ_16M : SZ_1M);
 		else if ((d & 3) == 1 && ry_is_ram(d & ~0x3ffU))
 			ry_walk_l2(d & ~0x3ffU, (u32)i << 20);
 		else
@@ -199,6 +241,8 @@ void __init rapuyama_lowmem_reserve(void)
 	/* the booter's own mapping of our block, that is the kernel */
 	bitmap_clear(ry_sym, (ry_kbase - RY_RAM_LO) >> PAGE_SHIFT,
 		     min_t(phys_addr_t, RY_CHUNK_MAP, RY_RAM_HI - ry_kbase) >> PAGE_SHIFT);
+	bitmap_clear(ry_keep, (ry_kbase - RY_RAM_LO) >> PAGE_SHIFT,
+		     min_t(phys_addr_t, RY_CHUNK_MAP, RY_RAM_HI - ry_kbase) >> PAGE_SHIFT);
 	if (!ry_lowmem) {
 		memblock_remove(RY_RAM_LO, ry_kbase - RY_RAM_LO);
 		return;
@@ -209,12 +253,13 @@ void __init rapuyama_lowmem_reserve(void)
 /* machine .init_early: memblock can grow now, hand out all but symbian's pages */
 void __init rapuyama_lowmem_init_early(void)
 {
+	unsigned long *map = ry_lowmem == 2 ? ry_keep : ry_sym;
 	unsigned int rs, re, kept = 0, low = 0;
 
 	if (!ry_lowmem || ry_kbase <= RY_RAM_LO)
 		return;
 	memblock_phys_free(RY_RAM_LO, ry_kbase - RY_RAM_LO);
-	for_each_set_bitrange(rs, re, ry_sym, RY_NPG) {
+	for_each_set_bitrange(rs, re, map, RY_NPG) {
 		memblock_reserve(RY_RAM_LO + ((phys_addr_t)rs << PAGE_SHIFT),
 				 (phys_addr_t)(re - rs) << PAGE_SHIFT);
 		kept += re - rs;
@@ -223,6 +268,9 @@ void __init rapuyama_lowmem_init_early(void)
 	}
 	pr_info("rapuyama: lowmem: %llu MB below the kernel back, %u KB of it kept for symbian (%u KB above)\n",
 		(u64)(ry_kbase - RY_RAM_LO) >> 20, low * 4, (kept - low) * 4);
+	if (ry_lowmem == 2)
+		pr_info("rapuyama: lowmem=2: %u KB of symbian's mapped pages released\n",
+			(unsigned int)(bitmap_weight(ry_sym, RY_NPG) - kept) * 4);
 }
 
 static u32 *ry_watch_virt;
@@ -286,7 +334,8 @@ static int __init ry_watch_init(void)
 {
 	unsigned int sym;
 
-	if (ry_lowwatch == 2 && ry_lowmem && ry_kbase > RY_RAM_LO) {
+	/* only with lowmem=1: with 2 most of these pages are linux's */
+	if (ry_lowwatch == 2 && ry_lowmem == 1 && ry_kbase > RY_RAM_LO) {
 		/* the kept pages are reserved linux ram: the linear map sees them */
 		ry_watch_npg = RY_NPG;
 		ry_watch_virt = phys_to_virt(RY_RAM_LO);

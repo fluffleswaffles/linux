@@ -151,7 +151,10 @@ static bool __init swd_keep(u32 va, phys_addr_t kbase)
 		return false;
 	}
 	if (pg < kbase || !memblock_is_memory(pg)) {
-		pr_info("rapuyama-swd: keep %08x pa %08x below linux\n", va, pa);
+		/* below the kernel is linux ram with e6.lowmem: lowmem keeps it */
+		if (memblock_is_memory(pg))
+			rapuyama_lowmem_keep(pg);
+		pr_info("rapuyama-swd: keep %08x pa %08x below the kernel\n", va, pa);
 		return true;
 	}
 	if (pg < __pa_symbol(_end)) {

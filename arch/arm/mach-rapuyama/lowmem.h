@@ -5,5 +5,6 @@
 void rapuyama_lowmem_reserve(void);
 void rapuyama_swd_reserve(void);
 void rapuyama_lowmem_init_early(void);
+void rapuyama_lowmem_keep(phys_addr_t pa);
 
 #endif

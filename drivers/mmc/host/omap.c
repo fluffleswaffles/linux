@@ -409,6 +409,9 @@ mmc_omap_start_command(struct mmc_omap_host *host, struct mmc_command *cmd)
 		   OMAP_MMC_STAT_END_OF_DATA;
 	if (cmd->opcode == MMC_ERASE)
 		irq_mask &= ~OMAP_MMC_STAT_DATA_TOUT;
+	/* level 1 dma: the fifo level irqs would fire for every word */
+	if (host->sdio_0x20 && host->dma_in_use)
+		irq_mask &= ~(OMAP_MMC_STAT_A_EMPTY | OMAP_MMC_STAT_A_FULL);
 	OMAP_MMC_WRITE(host, IE, irq_mask);
 	OMAP_MMC_WRITE(host, CMD, cmdreg);
 }
@@ -1013,16 +1016,26 @@ mmc_omap_prepare_data(struct mmc_omap_host *host, struct mmc_request *req)
 			burst = data->blksz;
 
 		burst >>= 1;
+		/*
+		 * rapuyama gdma: one 16-bit word per request, like the E5
+		 * firmware (BUF 0x8080: both dma enables, both levels 1 word)
+		 */
+		if (host->sdio_0x20)
+			burst = 1;
 
 		if (data->flags & MMC_DATA_WRITE) {
 			c = host->dma_tx;
 			bp = &host->dma_tx_burst;
 			buf = 0x0f80 | (burst - 1) << 0;
+			if (host->sdio_0x20)
+				buf = 0x0080;
 			dma_data_dir = DMA_TO_DEVICE;
 		} else {
 			c = host->dma_rx;
 			bp = &host->dma_rx_burst;
 			buf = 0x800f | (burst - 1) << 8;
+			if (host->sdio_0x20)
+				buf = 0x8000;
 			dma_data_dir = DMA_FROM_DEVICE;
 		}
 

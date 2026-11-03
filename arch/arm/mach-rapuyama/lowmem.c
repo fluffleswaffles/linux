@@ -14,6 +14,12 @@
  * e6.lowmem=0: drop the ram below the kernel like before. e6.lowwatch=1 then
  * checksums every page of it that Symbian doesn't map, every 30 s for 10 min,
  * and logs the ones that change: something (modem dma?) still writing there.
+ *
+ * e6.lowwatch=2 (with e6.lowmem=1, debug, changes nothing): print where every
+ * L2 table of symbian's kernel L1 copy points (below/low/high/top/io) and
+ * checksum the kept symbian pages instead, to find which of them are dead.
+ * Cached reads through the linear map (ram can't be remapped uncached); one
+ * pass reads ~36 MB, far more than the 256 KB L2, so nothing stays cached.
  */
 #include <linux/bitmap.h>
 #include <linux/export.h>
@@ -56,7 +62,8 @@ EXPORT_SYMBOL(rapuyama_vc_tx);
 
 static DECLARE_BITMAP(ry_sym, RY_NPG);
 static bool ry_lowmem;
-static bool ry_lowwatch;
+static unsigned int ry_lowwatch;	/* 1: unmapped pages, 2: kept pages */
+static bool ry_walk_report;
 static phys_addr_t ry_kbase;
 
 static int __init ry_lowmem_param(char *s)
@@ -67,7 +74,7 @@ early_param("e6.lowmem", ry_lowmem_param);
 
 static int __init ry_lowwatch_param(char *s)
 {
-	return kstrtobool(s, &ry_lowwatch);
+	return kstrtouint(s, 0, &ry_lowwatch);
 }
 early_param("e6.lowwatch", ry_lowwatch_param);
 
@@ -83,8 +90,26 @@ static void __init ry_mark(phys_addr_t pa, phys_addr_t len)
 			__set_bit((pa - RY_RAM_LO) >> PAGE_SHIFT, ry_sym);
 }
 
-static void __init ry_walk_l2(phys_addr_t tp)
+static const char *const ry_cls_name[] = { "below", "low", "high", "top", "io" };
+
+/* where a page of symbian's lands for the e6.lowwatch=2 report */
+static int __init ry_cls(phys_addr_t pa)
 {
+	if (pa < 0x10000000 || pa >= RY_RAM_HI)
+		return 4;
+	if (pa < RY_RAM_LO)
+		return 0;
+	if (pa < ry_kbase)
+		return 1;
+	if (pa < 0x1fb60000)	/* symbian-top in e5.dts */
+		return 2;
+	return 3;
+}
+
+static void __init ry_walk_l2(phys_addr_t tp, u32 va)
+{
+	unsigned int n[5] = { 0 };
+	u32 lo = ~0U, hi = 0, pa;
 	u32 *l2, e;
 	int j;
 
@@ -94,12 +119,24 @@ static void __init ry_walk_l2(phys_addr_t tp)
 		return;
 	for (j = 0; j < 256; j++) {
 		e = l2[j];
-		if (e & 2)
-			ry_mark(e & PAGE_MASK, PAGE_SIZE);
-		else if (e & 1)
-			ry_mark(e & 0xffff0000, SZ_64K);
+		if (e & 2) {
+			pa = e & PAGE_MASK;
+			ry_mark(pa, PAGE_SIZE);
+		} else if (e & 1) {
+			pa = e & 0xffff0000;
+			ry_mark(pa, SZ_64K);
+		} else {
+			continue;
+		}
+		n[ry_cls(pa)]++;
+		lo = min(lo, pa);
+		hi = max(hi, pa);
 	}
 	early_memunmap(l2, 0x400);
+	if (ry_walk_report)
+		pr_info("rapuyama: lowmap va %08x l2 %08x (%s): below %u low %u high %u top %u io %u, pa %08x..%08x\n",
+			va, (u32)tp, ry_cls_name[ry_cls(tp)], n[0], n[1], n[2],
+			n[3], n[4], n[0] + n[1] + n[2] + n[3] + n[4] ? lo : 0, hi);
 }
 
 /* short-descriptor L1: sections, supersections and L2 tables in ram */
@@ -118,7 +155,13 @@ static void __init ry_walk_l1(phys_addr_t l1pa)
 		else if ((d & 3) == 2)
 			ry_mark(d & 0xfff00000, SZ_1M);
 		else if ((d & 3) == 1 && ry_is_ram(d & ~0x3ffU))
-			ry_walk_l2(d & ~0x3ffU);
+			ry_walk_l2(d & ~0x3ffU, (u32)i << 20);
+		else
+			continue;
+		if (ry_walk_report && (d & 3) == 2 && ry_cls(d & 0xfff00000) < 4)
+			pr_info("rapuyama: lowmap va %08x section pa %08x (%s)\n",
+				(u32)i << 20, d & 0xfff00000,
+				ry_cls_name[ry_cls(d & 0xfff00000)]);
 	}
 	early_memunmap(l1, SZ_16K);
 }
@@ -144,7 +187,10 @@ void __init rapuyama_lowmem_reserve(void)
 	if (h && h[0] == RY_ISAH_MAGIC) {
 		ttbr1 = h[3] & ~0x3fffU;
 		early_memunmap(h, PAGE_SIZE);
+		/* report the isah copy only, the live table is near-identical */
+		ry_walk_report = ry_lowwatch == 2;
 		ry_walk_l1(RY_ISAH_PHYS + RY_ISAH_L1);
+		ry_walk_report = false;
 	} else if (h) {
 		early_memunmap(h, PAGE_SIZE);
 	}
@@ -203,7 +249,13 @@ static void ry_watch_scan(struct work_struct *work)
 	for (pg = 0; pg <= ry_watch_npg; pg++) {
 		bool hit = false;
 
-		if (pg < ry_watch_npg && !test_bit(pg, ry_sym)) {
+		/*
+		 * mode 2 skips no-map holes (ramcon with the isah block): not in
+		 * the linear map, and pfn_valid() is true for them on arm
+		 */
+		if (pg < ry_watch_npg && test_bit(pg, ry_sym) == (ry_lowwatch == 2) &&
+		    (ry_lowwatch != 2 ||
+		     memblock_is_map_memory(RY_RAM_LO + ((phys_addr_t)pg << PAGE_SHIFT)))) {
 			sum = ry_page_sum(ry_watch_virt + (pg << PAGE_SHIFT) / 4);
 			hit = ry_watch_pass && sum != ry_watch_sum[pg];
 			ry_watch_sum[pg] = sum;
@@ -234,7 +286,20 @@ static int __init ry_watch_init(void)
 {
 	unsigned int sym;
 
-	if (ry_lowmem || !ry_lowwatch || ry_kbase <= RY_RAM_LO)
+	if (ry_lowwatch == 2 && ry_lowmem && ry_kbase > RY_RAM_LO) {
+		/* the kept pages are reserved linux ram: the linear map sees them */
+		ry_watch_npg = RY_NPG;
+		ry_watch_virt = phys_to_virt(RY_RAM_LO);
+		ry_watch_sum = vzalloc(ry_watch_npg * sizeof(u32));
+		if (!ry_watch_sum)
+			return 0;
+		pr_info("rapuyama: lowwatch: watching the %u KB kept for symbian\n",
+			(unsigned int)bitmap_weight(ry_sym, RY_NPG) * 4);
+		INIT_DELAYED_WORK(&ry_watch_work, ry_watch_scan);
+		schedule_delayed_work(&ry_watch_work, 0);
+		return 0;
+	}
+	if (ry_lowmem || ry_lowwatch != 1 || ry_kbase <= RY_RAM_LO)
 		return 0;
 	ry_watch_npg = (ry_kbase - RY_RAM_LO) >> PAGE_SHIFT;
 	sym = bitmap_weight(ry_sym, ry_watch_npg);

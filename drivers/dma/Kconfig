@@ -640,6 +640,15 @@ config TEGRA210_ADMA
 	  data from memory to peripheral and vice versa. It does not
 	  support memory to memory data transfer.
 
+config RAPUYAMA_GDMA
+	tristate "Nokia RapuYama general purpose DMA"
+	depends on ARCH_RAPUYAMA || COMPILE_TEST
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Slave DMA on the GDMA of the Nokia RapuYama application ASIC
+	  (E5-00): the memory card controller uses it.
+
 config TIMB_DMA
 	tristate "Timberdale FPGA DMA support"
 	depends on MFD_TIMBERDALE || COMPILE_TEST

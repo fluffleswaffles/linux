@@ -33,7 +33,12 @@
  * reg 0x0c bit 8 enables it (isasw 0xc63301c4 sets it after the window);
  * on the E5 it then runs continuously and 0x0d holds the last finished
  * window. symbian leaves it on or off and at 1 or 20 units, so linux sets
- * the 5 s window and enables it at probe
+ * the 5 s window and enables it at probe.
+ *
+ * the capacity then uses the voltage without the load sag, v + |i| * r,
+ * r = ibat_mohm measured on the phone (screen off idle 82 mA vs screen at
+ * 255 + busy cpu 229 mA, 3 cycles: 20.6 mV / 147 mA = 140 mOhm). the low
+ * battery poweroff keeps the real voltage
  */
 #include <linux/devm-helpers.h>
 #include <linux/kernel.h>
@@ -126,6 +131,7 @@ struct ry_bat_cal {
 	unsigned int ocv_n;
 	u16 off_mv;
 	bool ibat;	/* gazoo current meter, E5 only so far */
+	u16 ibat_mohm;	/* battery + path resistance for the load sag */
 };
 
 static const struct ry_bat_cal e6_cal = {
@@ -141,6 +147,7 @@ static const struct ry_bat_cal e5_cal = {
 	.ocv = e5_ocv, .ocv_n = ARRAY_SIZE(e5_ocv),
 	.off_mv = 3300,
 	.ibat = true,
+	.ibat_mohm = 140,
 };
 
 static const struct ry_bat_cal *cal = &e6_cal;
@@ -232,6 +239,7 @@ static int ry_bat_capacity(int mv)
 }
 
 #define PCT_HOLD	60
+#define PCT_SETTLE	20	/* first ~20 s: % may still go up (meter warming up) */
 #define OFF_POLLS	30	/* ~30 s below off_mv */
 
 struct ry_bat {
@@ -239,14 +247,26 @@ struct ry_bat {
 	struct delayed_work poll;
 	int charger;
 	int mv16;	/* vbat averaged over ~16 s, mV * 16 */
+	int ocv16;	/* same without the load sag (= mv16 without a meter) */
+	int settle;	/* polls left in which % follows both ways */
 	int pct, hold;
 	int low;	/* polls in a row below cal->off_mv */
 };
 
 
+/* mV without the load sag; ua < 0 = discharging, so this adds |i| * r */
+static int ry_bat_ocv(int mv)
+{
+	int ua;
+
+	if (!cal->ibat_mohm || ry_bat_current(&ua))
+		return mv;
+	return mv - ua / 1000 * cal->ibat_mohm / 1000;
+}
+
 static void ry_bat_track(struct ry_bat *rb)
 {
-	int mv, want;
+	int mv, ocv, want;
 
 	if (ry_bat_vbat_mv(&mv))
 		return;
@@ -260,7 +280,20 @@ static void ry_bat_track(struct ry_bat *rb)
 	} else {
 		rb->low = 0;
 	}
-	want = ry_bat_capacity(rb->mv16 / 16);
+	ocv = ry_bat_ocv(mv);
+	if (rb->settle) {
+		/* faster average while the meter's first window comes in */
+		rb->ocv16 += (ocv * 16 - rb->ocv16) / 4;
+		want = ry_bat_capacity(rb->ocv16 / 16);
+		rb->settle--;
+		if (want != rb->pct) {
+			rb->pct = want;
+			power_supply_changed(rb->bat);
+		}
+		return;
+	}
+	rb->ocv16 += ocv - rb->ocv16 / 16;
+	want = ry_bat_capacity(rb->ocv16 / 16);
 	if (cal->no_charging) {
 		/* more than 5 % off: close half the gap now, no hold */
 		if (rb->pct - want > 5) {
@@ -420,7 +453,10 @@ static int ry_bat_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, ret, "no pmic adc\n");
 	rb->charger = ry_bat_charger();
 	rb->mv16 = mv * 16;
+	rb->ocv16 = mv * 16;
 	rb->pct = ry_bat_capacity(mv);
+	if (cal->ibat_mohm)
+		rb->settle = PCT_SETTLE;
 	if (!cal->ibat)
 		ry_bat_desc.num_properties = ARRAY_SIZE(ry_bat_props) - 1;
 	cfg.drv_data = rb;

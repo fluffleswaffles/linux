@@ -29,9 +29,12 @@
 
 #include <linux/bitfield.h>
 #include <linux/delay.h>
+#include <linux/devm-helpers.h>
+#include <linux/input.h>
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/soc/rapuyama-pmic.h>
@@ -70,7 +73,23 @@ struct rapuyama_wdt {
 	spinlock_t lock;
 	struct delayed_work dump;
 	u16 pmic_last[2][32];
+	struct input_dev *pwrkey;	/* optional, dt "nokia,power-key" */
+	struct delayed_work pwrkey_work;
 };
+
+/*
+ * E5 power key (red end key): not on the keypad matrix. a press latches gazoo
+ * irq 10, status dev 1 reg 0x01 bit 0 (write 1 to clear; isasw hal_kbd
+ * 0xc6344a18..), seen on the phone. the soc irq line of the gazoo is not
+ * known, so poll the latch. the latch fires on press AND on release (seen:
+ * a tap = two latches ~150 ms apart, a 1 s hold = two latches 1.2 s apart);
+ * each latch is reported as a press + release, e5-keyd pairs them. the key
+ * state (dev 1 reg 0x16 bit 0) would tell press from release: not confirmed
+ */
+#define PWRKEY_POLL_MS	150
+#define PWRKEY_DEV	1
+#define PWRKEY_REG	0x01
+#define PWRKEY_BIT	BIT(0)
 
 #ifdef CONFIG_ARCH_RAPUYAMA
 void rapuyama_early_wdt_stop(void);	/* arch/arm/mach-rapuyama */
@@ -351,6 +370,61 @@ static const struct watchdog_ops rapuyama_wdt_ops = {
 	.set_timeout	= rapuyama_wdt_set_timeout,
 };
 
+/* true: a press was latched (and is now cleared) */
+static bool rapuyama_pwrkey_latched(struct rapuyama_wdt *rw)
+{
+	unsigned long flags;
+	bool hit = false;
+	u16 v;
+
+	spin_lock_irqsave(&rw->lock, flags);
+	if (!__rapuyama_cbus_read(rw, PWRKEY_DEV, PWRKEY_REG, &v) &&
+	    (v & PWRKEY_BIT)) {
+		/* only this bit: the other status bits stay for whoever owns them */
+		__rapuyama_cbus_write(rw, PWRKEY_DEV, PWRKEY_REG, PWRKEY_BIT);
+		hit = true;
+	}
+	spin_unlock_irqrestore(&rw->lock, flags);
+	return hit;
+}
+
+static void rapuyama_pwrkey_poll(struct work_struct *work)
+{
+	struct rapuyama_wdt *rw = container_of(to_delayed_work(work),
+					       struct rapuyama_wdt, pwrkey_work);
+
+	if (rapuyama_pwrkey_latched(rw)) {
+		input_report_key(rw->pwrkey, KEY_POWER, 1);
+		input_sync(rw->pwrkey);
+		input_report_key(rw->pwrkey, KEY_POWER, 0);
+		input_sync(rw->pwrkey);
+	}
+	schedule_delayed_work(&rw->pwrkey_work, msecs_to_jiffies(PWRKEY_POLL_MS));
+}
+
+static int rapuyama_pwrkey_init(struct device *dev, struct rapuyama_wdt *rw)
+{
+	int ret;
+
+	rw->pwrkey = devm_input_allocate_device(dev);
+	if (!rw->pwrkey)
+		return -ENOMEM;
+	rw->pwrkey->name = "Nokia E5 power key";
+	rw->pwrkey->phys = "rapuyama-wdt/input0";
+	input_set_capability(rw->pwrkey, EV_KEY, KEY_POWER);
+	ret = input_register_device(rw->pwrkey);
+	if (ret)
+		return ret;
+	ret = devm_delayed_work_autocancel(dev, &rw->pwrkey_work,
+					   rapuyama_pwrkey_poll);
+	if (ret)
+		return ret;
+	/* a press from before linux (symbian) is not ours */
+	rapuyama_pwrkey_latched(rw);
+	schedule_delayed_work(&rw->pwrkey_work, msecs_to_jiffies(PWRKEY_POLL_MS));
+	return 0;
+}
+
 static int rapuyama_wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -417,8 +491,15 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 		schedule_delayed_work(&rw->dump, 0);
 	}
 
+	if (of_property_read_bool(dev->of_node, "nokia,power-key")) {
+		ret = rapuyama_pwrkey_init(dev, rw);
+		if (ret)
+			dev_warn(dev, "no power key: %d\n", ret);
+	}
+
 	WRITE_ONCE(rapuyama_pmic, rw);
-	dev_info(dev, "pmic + soc watchdog, %u s\n", rw->wdd.timeout);
+	dev_info(dev, "pmic + soc watchdog, %u s%s\n", rw->wdd.timeout,
+		 rw->pwrkey ? ", power key" : "");
 	return 0;
 }
 

@@ -84,6 +84,7 @@ struct gdma_chan {
 	unsigned int id;
 	int irq;
 	bool irq_on;
+	bool clk_on;
 	u32 drq;
 	struct dma_slave_config cfg;
 	struct gdma_desc *desc;
@@ -92,6 +93,7 @@ struct gdma_chan {
 struct gdma {
 	struct dma_device ddev;
 	void __iomem *base;
+	struct clk *clk;
 	spinlock_t glock;	/* global set/clear and drq registers */
 	struct gdma_chan chan[GDMA_NCH];
 };
@@ -183,6 +185,26 @@ static void gdma_start_sg(struct gdma_chan *c)
 	}
 }
 
+/*
+ * The clock is on only while a channel has work, as Symbian leaves it off
+ * when idle. No register state has to survive: every block reprograms the
+ * channel and the global set/clear/drq registers. clk core counts the users.
+ * vc.lock held.
+ */
+static void gdma_clk_get(struct gdma_chan *c)
+{
+	if (!c->clk_on && !clk_enable(c->gd->clk))
+		c->clk_on = true;
+}
+
+static void gdma_clk_put(struct gdma_chan *c)
+{
+	if (c->clk_on) {
+		c->clk_on = false;
+		clk_disable(c->gd->clk);
+	}
+}
+
 /* vc.lock held */
 static void gdma_start_next(struct gdma_chan *c)
 {
@@ -190,9 +212,12 @@ static void gdma_start_next(struct gdma_chan *c)
 
 	if (!vd) {
 		c->desc = NULL;
-		writel(0, c->regs + CH_CLAIM);
+		if (c->clk_on)
+			writel(0, c->regs + CH_CLAIM);
+		gdma_clk_put(c);
 		return;
 	}
+	gdma_clk_get(c);
 	list_del(&vd->node);
 	c->desc = to_gdma_desc(vd);
 	c->desc->cur = 0;
@@ -309,6 +334,7 @@ static int gdma_terminate_all(struct dma_chan *chan)
 		vchan_terminate_vdesc(&c->desc->vd);
 		c->desc = NULL;
 	}
+	gdma_clk_put(c);
 	vchan_get_all_descriptors(&c->vc, &head);
 	spin_unlock_irqrestore(&c->vc.lock, flags);
 	vchan_dma_desc_free_list(&c->vc, &head);
@@ -365,10 +391,11 @@ static int gdma_probe(struct platform_device *pdev)
 	gd->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(gd->base))
 		return PTR_ERR(gd->base);
-	/* off, the block reads all ones */
-	clk = devm_clk_get_enabled(dev, NULL);
+	/* off, the block reads all ones: enabled per transfer, gdma_clk_get() */
+	clk = devm_clk_get_prepared(dev, NULL);
 	if (IS_ERR(clk))
 		return dev_err_probe(dev, PTR_ERR(clk), "no clock\n");
+	gd->clk = clk;
 	spin_lock_init(&gd->glock);
 	of_property_read_u32(dev->of_node, "dma-channel-mask", &mask);
 

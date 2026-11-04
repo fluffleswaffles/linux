@@ -60,6 +60,9 @@
 #define E5FB_BPP		32
 #define E5FB_STRIDE		(E5FB_WIDTH * E5FB_BPP / 8)
 #define E5FB_SIZE		(E5FB_STRIDE * E5FB_HEIGHT)
+/* overlay (e5-keyd's key picture): opaque, the bottom half of the panel */
+#define E5FB_OVL_Y		120
+#define E5FB_OVL_SIZE		(E5FB_STRIDE * (E5FB_HEIGHT - E5FB_OVL_Y))
 
 /* RFBI registers (OMAP2 layout, offsets used by d_display.ldd) */
 #define RFBI_SYSSTATUS		0x14
@@ -129,6 +132,9 @@ struct e5fb {
 	struct fb_info *info;
 	u8 *vmem;
 	dma_addr_t vmem_dma;	/* valid when dispc is set */
+	u8 *ovl;		/* rows E5FB_OVL_Y.. while ovl_on, instead of vmem */
+	dma_addr_t ovl_dma;	/* valid when dispc is set */
+	bool ovl_on;		/* push_lock */
 
 	/* pending damage, in pixels, x1/y1 exclusive; empty when x0 >= x1 */
 	spinlock_t dmg_lock;
@@ -186,7 +192,9 @@ static bool e5fb_range(struct e5fb *fb, u8 cmd, u16 start, u16 end)
 }
 
 /* CPU path, push_lock held */
-static void e5fb_push_cpu(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
+/* src = panel row 0 of the source (vmem, or the overlay minus E5FB_OVL_Y rows) */
+static void e5fb_push_cpu(struct e5fb *fb, const u8 *src, u32 x0, u32 y0,
+			  u32 x1, u32 y1)
 {
 	u32 x, y;
 
@@ -197,7 +205,7 @@ static void e5fb_push_cpu(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 		return;
 
 	for (y = y0; y < y1; y++) {
-		const u32 *p = (const u32 *)(fb->vmem + y * E5FB_STRIDE) + x0;
+		const u32 *p = (const u32 *)(src + y * E5FB_STRIDE) + x0;
 
 		for (x = x0; x < x1; x++, p++) {
 			u32 v = READ_ONCE(*p);
@@ -220,7 +228,8 @@ static void e5fb_dma_regs(struct e5fb *fb, const char *why)
 }
 
 /* DMA path (d_display.ldd 0x80180498), push_lock held. false: not pushed */
-static bool e5fb_push_dma(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
+static bool e5fb_push_dma(struct e5fb *fb, dma_addr_t src, u32 x0, u32 y0,
+			  u32 x1, u32 y1)
 {
 	void __iomem *d = fb->dispc;
 	u32 w = x1 - x0, h = y1 - y0, size = (h - 1) << 16 | (w - 1);
@@ -236,11 +245,11 @@ static bool e5fb_push_dma(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 		dev_err(fb->dev, "dma clock enable failed, cpu path\n");
 		return false;
 	}
-	dma_sync_single_for_device(fb->dev, fb->vmem_dma + y0 * E5FB_STRIDE,
+	dma_sync_single_for_device(fb->dev, src + y0 * E5FB_STRIDE,
 				   h * E5FB_STRIDE, DMA_TO_DEVICE);
 	writel(DISPC_IRQ_FRAMEDONE | DISPC_IRQ_GFXENDWIN, d + DISPC_IRQSTATUS);
 
-	writel(fb->vmem_dma + y0 * E5FB_STRIDE + x0 * 4, d + DISPC_GFX_BA0);
+	writel(src + y0 * E5FB_STRIDE + x0 * 4, d + DISPC_GFX_BA0);
 	writel(0, d + DISPC_GFX_POSITION);
 	writel(size, d + DISPC_GFX_SIZE);
 	writel(size, d + DISPC_SIZE_LCD);
@@ -282,7 +291,27 @@ stop:
 	return !fb->dma_broken && !fb->dead;
 }
 
-/* push the rectangle [x0,x1) x [y0,y1) of the shadow buffer to the panel */
+/* one rectangle from one source, push_lock held. true: went by dma */
+static bool e5fb_push_src(struct e5fb *fb, const u8 *src, dma_addr_t src_dma,
+			  u32 x0, u32 y0, u32 x1, u32 y1)
+{
+	bool use_dma = dma && fb->dispc && !fb->dma_broken;
+
+	if (use_dma && !e5fb_push_dma(fb, src_dma, x0, y0, x1, y1)) {
+		use_dma = false;
+		if (fb->dead)
+			return false;
+	}
+	if (!use_dma)
+		e5fb_push_cpu(fb, src, x0, y0, x1, y1);
+	return use_dma;
+}
+
+/*
+ * push the rectangle [x0,x1) x [y0,y1) to the panel: from the shadow buffer,
+ * except rows E5FB_OVL_Y.. while the overlay is on (fbcon/X keep drawing
+ * into the shadow, the panel shows the overlay there)
+ */
 static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 {
 	ktime_t t0 = ktime_get();
@@ -291,14 +320,18 @@ static void e5fb_push(struct e5fb *fb, u32 x0, u32 y0, u32 x1, u32 y1)
 	mutex_lock(&fb->push_lock);
 	if (fb->dead || fb->asleep)
 		goto out;
-	use_dma = dma && fb->dispc && !fb->dma_broken;
-	if (use_dma && !e5fb_push_dma(fb, x0, y0, x1, y1)) {
-		use_dma = false;
+	if (fb->ovl_on && y1 > E5FB_OVL_Y) {
+		const u32 skip = E5FB_OVL_Y * E5FB_STRIDE;
+
+		if (y0 < E5FB_OVL_Y)
+			e5fb_push_src(fb, fb->vmem, fb->vmem_dma, x0, y0, x1, E5FB_OVL_Y);
 		if (fb->dead)
 			goto out;
+		use_dma = e5fb_push_src(fb, fb->ovl - skip, fb->ovl_dma - skip, x0,
+					max_t(u32, y0, E5FB_OVL_Y), x1, y1);
+	} else {
+		use_dma = e5fb_push_src(fb, fb->vmem, fb->vmem_dma, x0, y0, x1, y1);
 	}
-	if (!use_dma)
-		e5fb_push_cpu(fb, x0, y0, x1, y1);
 
 	if (!fb->dead && !fb->timed[use_dma] && x0 == 0 && y0 == 0 &&
 	    x1 == E5FB_WIDTH && y1 == E5FB_HEIGHT) {
@@ -459,6 +492,81 @@ static int e5fb_blank(int blank, struct fb_info *info)
 	return ret;
 }
 
+/* repaint the overlay rows from whatever is shown there now */
+static void e5fb_ovl_damage(struct e5fb *fb)
+{
+	e5fb_damage(fb, 0, E5FB_OVL_Y, E5FB_WIDTH, E5FB_HEIGHT - E5FB_OVL_Y);
+	schedule_delayed_work(&fb->work, 0);
+}
+
+/*
+ * overlay: the picture for rows E5FB_OVL_Y..E5FB_HEIGHT-1, xrgb8888, stride
+ * E5FB_STRIDE, written in one go or in chunks (sysfs splits big writes);
+ * shown after the chunk that ends at E5FB_OVL_SIZE
+ */
+static ssize_t overlay_write(struct file *file, struct kobject *kobj,
+			     struct bin_attribute *attr, char *buf,
+			     loff_t off, size_t count)
+{
+	struct e5fb *fb = dev_get_drvdata(kobj_to_dev(kobj));
+
+	if (!fb->ovl)
+		return -ENOMEM;
+	if (off < 0 || off + count > E5FB_OVL_SIZE)
+		return -EINVAL;
+	mutex_lock(&fb->push_lock);
+	memcpy(fb->ovl + off, buf, count);
+	mutex_unlock(&fb->push_lock);
+	if (off + count == E5FB_OVL_SIZE && READ_ONCE(fb->ovl_on))
+		e5fb_ovl_damage(fb);
+	return count;
+}
+static BIN_ATTR_WO(overlay, E5FB_OVL_SIZE);
+
+static ssize_t overlay_on_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct e5fb *fb = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(fb->ovl_on));
+}
+
+static ssize_t overlay_on_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct e5fb *fb = dev_get_drvdata(dev);
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+	if (on && !fb->ovl)
+		return -ENOMEM;
+	mutex_lock(&fb->push_lock);
+	fb->ovl_on = on;
+	mutex_unlock(&fb->push_lock);
+	e5fb_ovl_damage(fb);
+	return count;
+}
+static DEVICE_ATTR_RW(overlay_on);
+
+static struct attribute *e5fb_attrs[] = {
+	&dev_attr_overlay_on.attr,
+	NULL
+};
+
+static struct bin_attribute *e5fb_bin_attrs[] = {
+	&bin_attr_overlay,
+	NULL
+};
+
+static const struct attribute_group e5fb_group = {
+	.attrs = e5fb_attrs,
+	.bin_attrs = e5fb_bin_attrs,
+};
+__ATTRIBUTE_GROUPS(e5fb);
+
 static int e5fb_setcolreg(unsigned int regno, unsigned int red, unsigned int green,
 			  unsigned int blue, unsigned int transp, struct fb_info *info)
 {
@@ -480,6 +588,9 @@ static const struct fb_ops e5fb_ops = {
 
 static void e5fb_free_vmem(struct e5fb *fb)
 {
+	if (fb->ovl && fb->dispc)
+		dma_unmap_single(fb->dev, fb->ovl_dma, E5FB_OVL_SIZE, DMA_TO_DEVICE);
+	kfree(fb->ovl);
 	if (fb->dispc) {
 		dma_unmap_single(fb->dev, fb->vmem_dma, E5FB_SIZE, DMA_TO_DEVICE);
 		free_pages_exact(fb->vmem, PAGE_ALIGN(E5FB_SIZE));
@@ -560,6 +671,15 @@ static int e5fb_probe(struct platform_device *pdev)
 	if (!fb->vmem) {
 		ret = -ENOMEM;
 		goto err_release;
+	}
+	/* overlay: kmalloc is contiguous at this size; optional (sysfs -ENOMEM) */
+	fb->ovl = kzalloc(E5FB_OVL_SIZE, GFP_KERNEL);
+	if (fb->ovl && fb->dispc) {
+		fb->ovl_dma = dma_map_single(dev, fb->ovl, E5FB_OVL_SIZE, DMA_TO_DEVICE);
+		if (dma_mapping_error(dev, fb->ovl_dma)) {
+			kfree(fb->ovl);
+			fb->ovl = NULL;
+		}
 	}
 
 	defio = devm_kzalloc(dev, sizeof(*defio), GFP_KERNEL);
@@ -661,6 +781,7 @@ static struct platform_driver e5fb_driver = {
 	.driver	= {
 		.name		= "rapuyama-e5-fb",
 		.of_match_table	= e5fb_of_match,
+		.dev_groups	= e5fb_groups,
 	},
 };
 module_platform_driver(e5fb_driver);

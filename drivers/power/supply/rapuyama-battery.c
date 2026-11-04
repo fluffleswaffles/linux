@@ -24,9 +24,20 @@
  *
  * and its battery monitor (em_batmon5.c) gives the E5 capacity curve and
  * the low battery poweroff, see e5_ocv and e5_cal.off_mv
+ *
+ * E5 battery current (em_hal_me_ibat.c, em_hal_gazoo 0xc63335a2): the gazoo
+ * averages it in hardware. dev 2 reg 0x0c bits 7:0 = window in 250 ms units
+ * (symbian: 20 = 5 s), dev 2 reg 0x0d = signed sum over the window, 0x7fff /
+ * -0x8000 = no result. isasw: mA = -(sum / units) * 0.8030941611842105, i.e.
+ * positive = drawn from the battery; here negative = discharging.
+ * reg 0x0c bit 8 enables it (isasw 0xc63301c4 sets it after the window);
+ * on the E5 it then runs continuously and 0x0d holds the last finished
+ * window. symbian leaves it on or off and at 1 or 20 units, so linux sets
+ * the 5 s window and enables it at probe
  */
 #include <linux/devm-helpers.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -42,6 +53,13 @@
 #define ADC_VCHAR	9
 #define VCHAR_MIN	50	/* raw, a charger is in */
 #define VBAT_SAMPLES	4
+
+#define IBAT_DEV	2
+#define IBAT_WINDOW	0x0c	/* bits 7:0, 250 ms units */
+#define IBAT_ON		BIT(8)
+#define IBAT_UNITS	20	/* symbian's normal 5 s */
+#define IBAT_SUM	0x0d
+#define IBAT_NA_PER_LSB	803094	/* 0.8030941611842105 mA */
 
 /* isasw's scaler at raw 0, 16, 32 ... 1008 and 1023, kelvin */
 static const u16 btemp_k[] = {
@@ -107,6 +125,7 @@ struct ry_bat_cal {
 	const struct ry_ocv *ocv;
 	unsigned int ocv_n;
 	u16 off_mv;
+	bool ibat;	/* gazoo current meter, E5 only so far */
 };
 
 static const struct ry_bat_cal e6_cal = {
@@ -121,6 +140,7 @@ static const struct ry_bat_cal e5_cal = {
 	.btemp_k = e5_btemp_k, .btemp_n = ARRAY_SIZE(e5_btemp_k),
 	.ocv = e5_ocv, .ocv_n = ARRAY_SIZE(e5_ocv),
 	.off_mv = 3300,
+	.ibat = true,
 };
 
 static const struct ry_bat_cal *cal = &e6_cal;
@@ -163,6 +183,28 @@ static int ry_bat_temp(int *dc)
 		      ((int)cal->btemp_k[i] - cal->btemp_k[i + 1]) * 10 * (int)f / 16;
 	}
 	*dc = k10 - 2732;
+	return 0;
+}
+
+/* average over the meter's window, uA, negative = discharging */
+static int ry_bat_current(int *ua)
+{
+	u16 win, raw;
+	unsigned int units;
+	s16 sum;
+	int ret;
+
+	ret = rapuyama_pmic_update(IBAT_DEV, IBAT_WINDOW, 0, 0, &win);
+	if (!ret)
+		ret = rapuyama_pmic_update(IBAT_DEV, IBAT_SUM, 0, 0, &raw);
+	if (ret)
+		return ret;
+	units = win & 0xff;
+	sum = raw;
+	if (sum == 0x7fff || sum == -0x8000)
+		return -ENODATA;
+	/* isasw counts a window of 0 as 1 */
+	*ua = div_s64((s64)sum * IBAT_NA_PER_LSB, (units ?: 1) * 1000);
 	return 0;
 }
 
@@ -302,6 +344,11 @@ static int ry_bat_get(struct power_supply *psy, enum power_supply_property psp,
 	case POWER_SUPPLY_PROP_TEMP:
 		ret = ry_bat_temp(&val->intval);
 		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		if (!cal->ibat)
+			return -EINVAL;
+		ret = ry_bat_current(&val->intval);
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -315,9 +362,10 @@ static const enum power_supply_property ry_bat_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CURRENT_NOW,	/* last: left out without cal->ibat */
 };
 
-static const struct power_supply_desc ry_bat_desc = {
+static struct power_supply_desc ry_bat_desc = {
 	.name = "battery",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
 	.properties = ry_bat_props,
@@ -373,6 +421,8 @@ static int ry_bat_probe(struct platform_device *pdev)
 	rb->charger = ry_bat_charger();
 	rb->mv16 = mv * 16;
 	rb->pct = ry_bat_capacity(mv);
+	if (!cal->ibat)
+		ry_bat_desc.num_properties = ARRAY_SIZE(ry_bat_props) - 1;
 	cfg.drv_data = rb;
 	rb->bat = devm_power_supply_register(&pdev->dev, &ry_bat_desc, &cfg);
 	if (IS_ERR(rb->bat))
@@ -394,6 +444,14 @@ static int ry_bat_probe(struct platform_device *pdev)
 	else
 		dev_info(&pdev->dev, "%d mV, %d.%d C, charger %s\n", mv,
 			 dc / 10, abs(dc % 10), ry_bat_charger() ? "in" : "out");
+	if (cal->ibat) {
+		u16 old = 0;
+
+		ret = rapuyama_pmic_update(IBAT_DEV, IBAT_WINDOW, IBAT_ON | 0xff,
+					   IBAT_ON | IBAT_UNITS, &old);
+		dev_info(&pdev->dev, "current meter: was 0x%04x, now %u x 250 ms, on (%d)\n",
+			 old, IBAT_UNITS, ret);
+	}
 	return 0;
 }
 

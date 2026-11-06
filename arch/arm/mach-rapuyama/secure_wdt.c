@@ -28,17 +28,23 @@
 /* one firmware image: everything below was checked against its dump */
 struct swd_fw {
 	const char *compat;
+	const char *name;
 	u32 isah_ver;
 	u32 guest_phys, guest_size, guest_end;
 	u32 sig_off[3], sig[3];		/* alloc, free, pet prologues */
 	u32 token_lit;			/* code offset of the token pointer */
 	u32 sp_off;			/* guest offset of the parked task sp */
 	u32 alloc_fn, free_fn, pet_fn;
+	u32 pat_ptr;			/* E5: va of the pointer to the protected app table */
 };
 
+/*
+ * Several E5 firmwares share the "nokia,e5" compatible: the entry is chosen by
+ * its ISASW function prologues (swd_find_e5_fw()), first match wins.
+ */
 static const struct swd_fw swd_fws[] = {
 	{	/* E6: the values of the original E6-only bridge */
-		.compat = "nokia,e6", .isah_ver = 1,
+		.compat = "nokia,e6", .name = "E6", .isah_ver = 1,
 		.guest_phys = 0x1f8b0000, .guest_size = 0x30000,
 		.guest_end = 0xc6c4c000,
 		.sig_off = { 0x61abe, 0x619b8, 0x62b38 },
@@ -48,7 +54,7 @@ static const struct swd_fw swd_fws[] = {
 		.pet_fn = 0xc6262b39,
 	},
 	{	/* E5 fw 101.003, dump1 + run 4 (e5bot3 v2 isah) */
-		.compat = "nokia,e5", .isah_ver = 2,
+		.compat = "nokia,e5", .name = "E5 fw 101.003", .isah_ver = 2,
 		.guest_phys = 0x1fd50000, .guest_size = 0x36000,
 		.guest_end = 0xc6a80000,
 		.sig_off = { 0x69442, 0x6933c, 0x6a2ee },
@@ -56,6 +62,20 @@ static const struct swd_fw swd_fws[] = {
 		.token_lit = 0x61a64, .sp_off = 0x35f74,
 		.alloc_fn = 0xc6369443, .free_fn = 0xc636933d,
 		.pet_fn = 0xc636a2ef,
+		.pat_ptr = 0xc6831104,		/* -> 0xcb294000 in run 4 */
+	},
+	{	/* E5 fw 071.003: code -0x31a4, data -0xf0 against 101.003 (own dump);
+		 * run on the phone with the bridge ticking (pat_ptr = the 101.003
+		 * value -0xf0) */
+		.compat = "nokia,e5", .name = "E5 fw 071.003", .isah_ver = 2,
+		.guest_phys = 0x1fd50000, .guest_size = 0x36000,
+		.guest_end = 0xc6a80000,
+		.sig_off = { 0x6629e, 0x66198, 0x6714a },
+		.sig = { 0x4605b570, 0x4606b5f8, 0x4605b5fe },
+		.token_lit = 0x5e8c0, .sp_off = 0x35e84,
+		.alloc_fn = 0xc636629f, .free_fn = 0xc6366199,
+		.pet_fn = 0xc636714b,
+		.pat_ptr = 0xc6831014,
 	},
 };
 
@@ -83,6 +103,7 @@ static struct swd_call *swd;
 static struct delayed_work swd_work;
 static u32 swd_calls;
 static int swd_keep_state;	/* E5: 1 all symbian pages safe, -1 not */
+static const struct swd_fw *swd_sel __initdata;	/* E5: entry chosen by its signatures */
 
 static int __init swd_param(char *s)
 {
@@ -104,7 +125,6 @@ static const u32 e5_keep_va[] __initconst = {
 	0x8008c23c, 0xc0030000, 0xc1003000,
 };
 static const u32 e5_walk_mb[] __initconst = { 0xc63, 0xc68, 0xc6b, 0xcb2 };
-#define E5_PAT_PTR	0xc6831104	/* -> 0xcb294000 in run 4 */
 #define E5_PAT_MAX	64
 #define E5_PA_MAX	SZ_64K
 
@@ -181,6 +201,33 @@ static u32 __init swd_read(u32 va)
 	return v;
 }
 
+/* E5: the entry whose ISASW prologues are in the code ram, NULL if none */
+static const struct swd_fw *__init swd_find_e5_fw(void)
+{
+	const struct swd_fw *fw;
+	int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(swd_fws); i++) {
+		fw = &swd_fws[i];
+		if (strcmp(fw->compat, "nokia,e5"))
+			continue;
+		for (j = 0; j < 3; j++) {
+			u8 *p = early_memremap(CODE_PHYS + fw->sig_off[j], 4);
+			bool ok;
+
+			if (!p)
+				break;
+			ok = get_unaligned_le32(p) == fw->sig[j];
+			early_memunmap(p, 4);
+			if (!ok)
+				break;
+		}
+		if (j == 3)
+			return fw;
+	}
+	return NULL;
+}
+
 void __init rapuyama_swd_reserve(void)
 {
 	phys_addr_t kbase = round_down(__pa_symbol(_text), SZ_2M);
@@ -201,6 +248,13 @@ void __init rapuyama_swd_reserve(void)
 		swd_keep_state = -1;
 		return;
 	}
+	swd_sel = swd_find_e5_fw();
+	if (!swd_sel) {
+		pr_err("rapuyama-swd: unknown ISASW build (not in swd_fws[]), nothing kept\n");
+		swd_keep_state = -1;
+		return;
+	}
+	pr_info("rapuyama-swd: ISASW build %s\n", swd_sel->name);
 	for (i = 0; i < ARRAY_SIZE(e5_keep_va); i++)
 		ok &= swd_keep(e5_keep_va[i], kbase);
 	for (i = 0; i < ARRAY_SIZE(e5_walk_mb); i++) {
@@ -212,7 +266,7 @@ void __init rapuyama_swd_reserve(void)
 		ok &= swd_keep(0xfc000000 + ((d & ~0x3ffU) >> 12) * 32, kbase);
 	}
 	/* {offset, length?, ..., name at +0x14}, 0xff name ends the table */
-	pat = swd_read(E5_PAT_PTR);
+	pat = swd_read(swd_sel->pat_ptr);
 	pr_info("rapuyama-swd: protected app table %08x\n", pat);
 	for (rec = 0; pat && rec < E5_PAT_MAX; rec++) {
 		va = pat + rec * 0x20;
@@ -339,9 +393,12 @@ static int __init rapuyama_swd_init(void)
 	BUILD_BUG_ON(offsetof(struct swd_call, guest_sctlr) != 96);
 	if (!swd_enabled)
 		return 0;
-	for (i = 0; i < ARRAY_SIZE(swd_fws); i++)
-		if (of_machine_is_compatible(swd_fws[i].compat))
-			fw = &swd_fws[i];
+	if (of_machine_is_compatible("nokia,e5"))
+		fw = swd_sel;	/* chosen by its signatures in rapuyama_swd_reserve() */
+	else
+		for (i = 0; i < ARRAY_SIZE(swd_fws); i++)
+			if (of_machine_is_compatible(swd_fws[i].compat))
+				fw = &swd_fws[i];
 	if (!fw)
 		return 0;
 	h = memremap(ISAH_PHYS, 0x5000, MEMREMAP_WB);
@@ -386,7 +443,7 @@ static int __init rapuyama_swd_init(void)
 	swd->token = get_unaligned_le16(guest + token_ptr - GUEST_VIRT + 2);
 	INIT_DELAYED_WORK(&swd_work, swd_ping);
 	pr_info("rapuyama-swd: PA_SWD 0x1f ready (%s), token %u guest stack %08x\n",
-		fw->compat, swd->token, sp);
+		fw->name, swd->token, sp);
 	schedule_delayed_work(&swd_work, 5 * HZ);
 	ret = 0;
 out:

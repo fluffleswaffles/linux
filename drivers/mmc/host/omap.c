@@ -1322,6 +1322,10 @@ static int mmc_omap_new_slot(struct mmc_omap_host *host, int id)
 		mmc->caps |= MMC_CAP_4_BIT_DATA;
 	if (of_property_read_bool(host->dev->of_node, "broken-cd"))
 		mmc->caps |= MMC_CAP_NEEDS_POLL;
+	/* nokia,rapuyama-mmc: let the core switch a high speed card into
+	 * high speed mode (>25 MHz), only when the board says it works */
+	if (of_property_read_bool(host->dev->of_node, "cap-sd-highspeed"))
+		mmc->caps |= MMC_CAP_SD_HIGHSPEED;
 
 	mmc->ops = &mmc_omap_ops;
 	mmc->f_min = 400000;

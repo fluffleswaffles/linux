@@ -16,6 +16,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 #include <linux/slab.h>
 #include <linux/time.h>
@@ -41,6 +42,10 @@ static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;	/* ID for this card */
 static bool enable[SNDRV_CARDS] = {1, [1 ... (SNDRV_CARDS - 1)] = 0};
 static int pcm_substreams[SNDRV_CARDS] = {[0 ... (SNDRV_CARDS - 1)] = 8};
 static int pcm_notify[SNDRV_CARDS];
+/* Some non-coherent platforms need identical kernel/user PCM mappings. */
+static bool coherent_buffers;
+module_param(coherent_buffers, bool, 0444);
+MODULE_PARM_DESC(coherent_buffers, "Opt-in coherent kernel/user PCM buffers");
 static char *timer_source[SNDRV_CARDS];
 
 module_param_array(index, int, NULL, 0444);
@@ -1364,7 +1369,12 @@ static int loopback_pcm_new(struct loopback *loopback,
 		return err;
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &loopback_pcm_ops);
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &loopback_pcm_ops);
-	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
+	if (coherent_buffers)
+		snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV,
+					   loopback->card->dev, 0, 0);
+	else
+		snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC,
+					   NULL, 0, 0);
 
 	pcm->private_data = loopback;
 	pcm->info_flags = 0;
@@ -1796,6 +1806,11 @@ static int loopback_probe(struct platform_device *devptr)
 	int dev = devptr->id;
 	int err;
 
+	if (coherent_buffers) {
+		err = dma_coerce_mask_and_coherent(&devptr->dev, DMA_BIT_MASK(32));
+		if (err)
+			return err;
+	}
 	err = snd_devm_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
 				sizeof(struct loopback), &card);
 	if (err < 0)

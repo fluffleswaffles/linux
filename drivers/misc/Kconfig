@@ -610,6 +610,14 @@ config MARVELL_CN10K_DPI
 	  To compile this driver as a module, choose M here: the module
 	  will be called mrvl_cn10k_dpi.
 
+config RAPUYAMA_SIM_BRIDGE
+	tristate "Nokia E5 SIM bridge for the userspace ISASW runtime"
+	depends on ARCH_RAPUYAMA && OF
+	help
+	  /dev/rapuyama-sim: SIM controller registers, Gazoo PMIC accesses on
+	  an allowlist, the SIM interrupts and the ADC for the userspace modem
+	  firmware runtime (linux/e5-cell). Does nothing until it is used.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

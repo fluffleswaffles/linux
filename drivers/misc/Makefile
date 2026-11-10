@@ -81,3 +81,4 @@ obj-y				+= keba/
 obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_sweep.o
 obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_theories.o
 obj-$(CONFIG_RAPUYAMA_MODEM)	+= rapuyama_isasw.o
+obj-$(CONFIG_RAPUYAMA_SIM_BRIDGE)	+= rapuyama_sim.o

@@ -70,6 +70,8 @@ struct rapuyama_wdt {
 	void __iomem *cbus;
 	void __iomem *soc;
 	void __iomem *reset;	/* optional */
+	void __iomem *hwsem;	/* optional: cbus hardware semaphore shared with the modem */
+	unsigned long hwsem_takes, hwsem_misses;
 	spinlock_t lock;
 	struct delayed_work dump;
 	u16 pmic_last[2][32];
@@ -115,10 +117,46 @@ static int rapuyama_cbus_wait(struct rapuyama_wdt *rw)
 	return 0;
 }
 
+/*
+ * the modem (E5 isasw pmic read/write c63ec6b0/c63ec64a) takes hardware
+ * semaphore 0 (pa 0x20040204) around every cbus transfer: a read >= 1 grants
+ * it (c63d8514), writing ~0 releases it (c63d852c). without it our transfers
+ * collide with the modem's once its radio is active (busy timeouts seen).
+ * optional 4th reg; rw->lock held, irqs off like the modem's critical section
+ */
+/*
+ * not granted within CBUS_TRIES us: go on without it (the behaviour before
+ * the semaphore, so a misread semaphore can never stop the watchdog kicks)
+ * and count it (debugfs-free: shown in the probe line and adc sysfs dump)
+ */
+static bool rapuyama_hwsem_take(struct rapuyama_wdt *rw)
+{
+	int n = CBUS_TRIES;
+
+	if (!rw->hwsem)
+		return false;
+	while ((s32)readl(rw->hwsem) < 1) {
+		if (!--n) {
+			rw->hwsem_misses++;
+			return false;
+		}
+		udelay(1);
+	}
+	rw->hwsem_takes++;
+	return true;
+}
+
+static void rapuyama_hwsem_give(struct rapuyama_wdt *rw, bool held)
+{
+	if (held)
+		writel(~0u, rw->hwsem);
+}
+
 /* rw->lock held */
 static int __rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 				 u16 val)
 {
+	bool held = rapuyama_hwsem_take(rw);
 	int ret;
 
 	writel(1, rw->cbus + CBUS_EN);
@@ -128,6 +166,7 @@ static int __rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 	writel(dev << 6 | reg, rw->cbus + CBUS_WR_CMD);
 	ret = rapuyama_cbus_wait(rw);
 	writel(0, rw->cbus + CBUS_EN);
+	rapuyama_hwsem_give(rw, held);
 	return ret;
 }
 
@@ -148,6 +187,7 @@ static int rapuyama_cbus_write(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 static int __rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 				u16 *val)
 {
+	bool held = rapuyama_hwsem_take(rw);
 	int ret;
 
 	writel(1, rw->cbus + CBUS_EN);
@@ -157,6 +197,7 @@ static int __rapuyama_cbus_read(struct rapuyama_wdt *rw, u32 dev, u32 reg,
 	if (!ret)
 		*val = readl(rw->cbus + CBUS_DATA);
 	writel(0, rw->cbus + CBUS_EN);
+	rapuyama_hwsem_give(rw, held);
 	return ret;
 }
 
@@ -260,6 +301,9 @@ static ssize_t adc_show(struct device *dev, struct device_attribute *attr,
 		else
 			len += sysfs_emit_at(buf, len, "%2u %4u\n", ch, raw);
 	}
+	if (rw->hwsem)
+		len += sysfs_emit_at(buf, len, "cbus semaphore taken %lu missed %lu\n",
+				     rw->hwsem_takes, rw->hwsem_misses);
 	return len;
 }
 static DEVICE_ATTR_RO(adc);
@@ -445,6 +489,11 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	rw->reset = devm_platform_ioremap_resource(pdev, 2);
 	if (IS_ERR(rw->reset))
 		rw->reset = NULL;
+	if (platform_get_resource(pdev, IORESOURCE_MEM, 3)) {
+		rw->hwsem = devm_platform_ioremap_resource(pdev, 3);
+		if (IS_ERR(rw->hwsem))
+			return PTR_ERR(rw->hwsem);
+	}
 
 	spin_lock_init(&rw->lock);
 
@@ -498,8 +547,9 @@ static int rapuyama_wdt_probe(struct platform_device *pdev)
 	}
 
 	WRITE_ONCE(rapuyama_pmic, rw);
-	dev_info(dev, "pmic + soc watchdog, %u s%s\n", rw->wdd.timeout,
-		 rw->pwrkey ? ", power key" : "");
+	dev_info(dev, "pmic + soc watchdog, %u s%s%s (taken %lu, missed %lu)\n", rw->wdd.timeout,
+		 rw->pwrkey ? ", power key" : "",
+		 rw->hwsem ? ", cbus semaphore" : "", rw->hwsem_takes, rw->hwsem_misses);
 	return 0;
 }
 

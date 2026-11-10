@@ -20,18 +20,38 @@
 #include <asm/cacheflush.h>
 #include <asm/outercache.h>
 
-#define MDI_AP_PHYS		0x1f8b0000
-#define MDI_AP_VIRT		0xc6800000U
-#define MDI_AP_SIZE		0x44d000
-#define MDI_DSP_PHYS		0x10140000
-#define MDI_DSP_VIRT		0x90c00000U
-#define MDI_DSP_SIZE		0xbf000
-#define MDI_DSP_PHYS_BASE	0x10000000
 /*
- * see secure_wdt.c
-*/
-#define MDI_AP_SWD_STACK	0xf8000
-#define MDI_AP_SWD_STACK_SIZE	0x6000
+ * Where the preserved firmware's RAM and the DSP buffer window are, per phone.
+ * ap = the ISASW data (runtime private copy at ap_virt), dsp = the DSP shared
+ * buffers (runtime copy at dsp_virt). Descriptors carry physical - 0x10000000.
+ * The PA_SWD bridge borrows a stopped task's stack inside the ISASW data (see
+ * secure_wdt.c); copied buffers never overlap it.
+ */
+struct mdi_layout {
+	const char *compat;
+	u32 ap_phys, ap_virt, ap_size;
+	u32 dsp_phys, dsp_virt, dsp_size;
+	u32 swd_stack, swd_stack_size;
+};
+static const struct mdi_layout mdi_layouts[] = {
+	{ "nokia,e6", 0x1f8b0000, 0xc6800000, 0x44d000,
+	  0x10140000, 0x90c00000, 0xbf000, 0xf8000, 0x6000 },
+	/* E5 fw 101.003: ISASW data pa 0x1fd50000 (va c6800000, 2.5 MB); DSP
+	 * buffers pa 0x10140000 = Symbian va cb500000 (512 KB, the rest of that
+	 * MB is other memory); PA_SWD stack sp c68d7e6c */
+	{ "nokia,e5", 0x1fd50000, 0xc6800000, 0x280000,
+	  0x10140000, 0xcb500000, 0x80000, 0xd2000, 0x6000 },
+};
+static const struct mdi_layout *L;
+#define MDI_AP_PHYS		(L->ap_phys)
+#define MDI_AP_VIRT		(L->ap_virt)
+#define MDI_AP_SIZE		(L->ap_size)
+#define MDI_DSP_PHYS		(L->dsp_phys)
+#define MDI_DSP_VIRT		(L->dsp_virt)
+#define MDI_DSP_SIZE		(L->dsp_size)
+#define MDI_DSP_PHYS_BASE	0x10000000
+#define MDI_AP_SWD_STACK	(L->swd_stack)
+#define MDI_AP_SWD_STACK_SIZE	(L->swd_stack_size)
 #define MDI_AP			0
 #define MDI_DSP			0x110
 #define MDI_SLOTS		16
@@ -564,9 +584,13 @@ static int mdi_probe(struct platform_device *pdev)
 	struct resource *ctrl = platform_get_resource(pdev, IORESOURCE_MEM, 1);
 	struct rapuyama_mdi *mdi;
 	u32 ap, dsp;
+	unsigned int i;
 	int ret;
 
-	if (!of_machine_is_compatible("nokia,e6") || !ring || !ctrl ||
+	for (i = 0; i < ARRAY_SIZE(mdi_layouts); i++)
+		if (of_machine_is_compatible(mdi_layouts[i].compat))
+			L = &mdi_layouts[i];
+	if (!L || !ring || !ctrl ||
 	    ring->start != 0x30003ce0 || resource_size(ring) != 0x220 ||
 	    ctrl->start != 0x20040280 || resource_size(ctrl) != 12)
 		return -EINVAL;
@@ -679,6 +703,7 @@ static void mdi_remove(struct platform_device *pdev)
 
 static const struct of_device_id mdi_match[] = {
 	{ .compatible = "nokia,e6-mdi" },
+	{ .compatible = "nokia,e5-mdi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, mdi_match);

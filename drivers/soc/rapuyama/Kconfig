@@ -17,12 +17,12 @@ config SOC_RAPUYAMA_VIDEOCORE
 	  If unsure, say N.
 
 config SOC_RAPUYAMA_MDI
-	tristate "Nokia E6 MCU to DSP MDI descriptor transport"
+	tristate "Nokia E5/E6 MCU to DSP MDI descriptor transport"
 	depends on ARCH_RAPUYAMA && OF
 	help
 	  Adopts the firmware's existing MCU/DSP descriptor rings and exposes
 	  16-byte descriptors through /dev/rapuyama-mdi. The device tree must
-	  supply the E6 ring addresses and the RX/TX completion interrupts.
+	  supply the ring addresses and the RX/TX completion interrupts.
 	  This driver does not reset or cold-initialize the modem or its DSP.
 
 	  If unsure, say N.

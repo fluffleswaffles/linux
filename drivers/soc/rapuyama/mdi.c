@@ -78,6 +78,7 @@ struct mdi_file {
 	unsigned int events;
 	struct mm_struct *mm;
 	bool buffers;
+	bool dsp_direct;	/* buffers mode 2: the runtime maps the DSP window (mmap), no copies */
 };
 
 static void mdi_free(struct kref *refs)
@@ -257,7 +258,7 @@ static int mdi_rx_buffer(struct mdi_file *context, const __le32 descriptor[4])
 	void *copy;
 	int ret = 0;
 
-	if (!context->buffers)
+	if (!context->buffers || context->dsp_direct)
 		return 0;
 	if (context->mm != current->mm)
 		return -EXDEV;
@@ -489,7 +490,7 @@ static long mdi_ioctl(struct file *file, unsigned int command,
 		if (copy_from_user(&buffers, (void __user *)argument,
 				   sizeof(buffers)))
 			return -EFAULT;
-		if (buffers > 1)
+		if (buffers > 2)
 			return -EINVAL;
 		ret = mutex_lock_interruptible(&mdi->io);
 		if (ret)
@@ -500,6 +501,7 @@ static long mdi_ioctl(struct file *file, unsigned int command,
 		}
 		if (!buffers) {
 			context->buffers = false;
+			context->dsp_direct = false;
 			if (context->mm) {
 				mmput(context->mm);
 				context->mm = NULL;
@@ -533,7 +535,8 @@ static long mdi_ioctl(struct file *file, unsigned int command,
 			ret = -EINVAL;
 			goto unlock;
 		}
-		if (!context->buffers) {
+		context->dsp_direct = buffers == 2;
+		if (!context->buffers && !context->dsp_direct) {
 			ret = mdi_dsp_snapshot(mdi);
 			if (ret)
 				goto unlock;
@@ -568,6 +571,23 @@ unlock:
 	return ret;
 }
 
+/*
+ * The DSP buffer window itself (MDI_DSP_PHYS, outside Linux RAM), write-combine
+ * (normal uncached: the firmware may access it unaligned). With buffers mode 2
+ * the runtime uses it at MDI_DSP_VIRT instead of the copy: the DSP also reads
+ * and writes buffers no descriptor names (e.g. the DCH transport-block ring).
+ */
+static int mdi_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	if (vma->vm_pgoff || size != MDI_DSP_SIZE)
+		return -EINVAL;
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	return remap_pfn_range(vma, vma->vm_start, MDI_DSP_PHYS >> PAGE_SHIFT,
+			       size, vma->vm_page_prot);
+}
+
 static const struct file_operations mdi_fops = {
 	.owner = THIS_MODULE,
 	.open = mdi_open,
@@ -576,6 +596,7 @@ static const struct file_operations mdi_fops = {
 	.write = mdi_write,
 	.poll = mdi_poll,
 	.unlocked_ioctl = mdi_ioctl,
+	.mmap = mdi_mmap,
 };
 
 static int mdi_probe(struct platform_device *pdev)

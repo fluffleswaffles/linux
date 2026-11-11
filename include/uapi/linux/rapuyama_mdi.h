@@ -15,6 +15,8 @@ struct rapuyama_mdi_status {
 };
 
 #define RAPUYAMA_MDI_STATUS	_IOR('M', 0, struct rapuyama_mdi_status)
+/* 0 off, 1 copied buffers (AP data + DSP window copies), 2 AP copies with the
+ * DSP window mmap()ed directly (mmap the whole window at its firmware address) */
 #define RAPUYAMA_MDI_BUFFERS	_IOW('M', 1, __u32)
 
 #endif

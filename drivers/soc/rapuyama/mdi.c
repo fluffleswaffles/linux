@@ -287,6 +287,85 @@ free:
 	return ret;
 }
 
+/*
+ * Copied buffers: the firmware also hands the DSP buffers by address inside a
+ * message (CELL_DCH uplink transport blocks: resource 0x3b message 0x61 names
+ * a DSP window address). The runtime writes those bytes through here, before
+ * it publishes the message; the window is only reached through dsp_memory
+ * (a user mapping of it stopped the DSP, xg19/xg27).
+ */
+static int mdi_dsp_put(struct mdi_file *context, const void __user *argument)
+{
+	struct rapuyama_mdi *mdi = context->mdi;
+	struct rapuyama_mdi_put put;
+	void *copy;
+	int ret;
+
+	if (copy_from_user(&put, argument, sizeof(put)))
+		return -EFAULT;
+	if (!put.size || put.size > 4096 || put.offset >= MDI_DSP_SIZE ||
+	    put.size > MDI_DSP_SIZE - put.offset)
+		return -EINVAL;
+	copy = memdup_user(u64_to_user_ptr(put.buffer), put.size);
+	if (IS_ERR(copy))
+		return PTR_ERR(copy);
+	ret = mutex_lock_interruptible(&mdi->io);
+	if (ret)
+		goto free;
+	if (mdi->dying)
+		ret = -ENODEV;
+	else if (!context->buffers || context->dsp_direct || !mdi->dsp_memory)
+		ret = -EINVAL;
+	else {
+		memcpy_toio(mdi->dsp_memory + put.offset, copy, put.size);
+		wmb();
+	}
+	mutex_unlock(&mdi->io);
+free:
+	kfree(copy);
+	return ret;
+}
+
+/*
+ * Copied buffers, the other direction: the DSP also hands the firmware buffers
+ * by address (HSDPA MAC-hs PDUs named in the HS data indication). The firmware
+ * invalidates such a range before it reads it; the runtime turns that into a
+ * copy of the real window bytes into its private copy through here.
+ */
+static int mdi_dsp_get(struct mdi_file *context, const void __user *argument)
+{
+	struct rapuyama_mdi *mdi = context->mdi;
+	struct rapuyama_mdi_put get;
+	void *copy;
+	int ret;
+
+	if (copy_from_user(&get, argument, sizeof(get)))
+		return -EFAULT;
+	if (!get.size || get.size > 8192 || get.offset >= MDI_DSP_SIZE ||
+	    get.size > MDI_DSP_SIZE - get.offset)
+		return -EINVAL;
+	copy = kmalloc(get.size, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	ret = mutex_lock_interruptible(&mdi->io);
+	if (ret)
+		goto free;
+	if (mdi->dying)
+		ret = -ENODEV;
+	else if (!context->buffers || context->dsp_direct || !mdi->dsp_memory)
+		ret = -EINVAL;
+	else {
+		rmb();
+		memcpy_fromio(copy, mdi->dsp_memory + get.offset, get.size);
+	}
+	mutex_unlock(&mdi->io);
+	if (!ret && copy_to_user(u64_to_user_ptr(get.buffer), copy, get.size))
+		ret = -EFAULT;
+free:
+	kfree(copy);
+	return ret;
+}
+
 static ssize_t mdi_read(struct file *file, char __user *buffer, size_t count,
 			loff_t *offset)
 {
@@ -545,6 +624,10 @@ static long mdi_ioctl(struct file *file, unsigned int command,
 		ret = 0;
 		goto unlock;
 	}
+	if (command == RAPUYAMA_MDI_DSP_PUT)
+		return mdi_dsp_put(context, (void __user *)argument);
+	if (command == RAPUYAMA_MDI_DSP_GET)
+		return mdi_dsp_get(context, (void __user *)argument);
 	if (command != RAPUYAMA_MDI_STATUS)
 		return -ENOTTY;
 	ret = mutex_lock_interruptible(&mdi->io);

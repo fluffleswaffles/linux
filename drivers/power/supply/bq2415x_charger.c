@@ -155,7 +155,11 @@ static char *bq2415x_chip_name[] = {
 	"bq24158",
 };
 
+struct bq2415x_energy;
+
 struct bq2415x_device {
+	struct bq2415x_energy *energy;
+	bool firmware_owned;
 	struct device *dev;
 	struct bq2415x_platform_data init_data;
 	struct power_supply *charger;
@@ -260,7 +264,7 @@ static int bq2415x_i2c_write(struct bq2415x_device *bq, u8 reg, u8 val)
 	msg[0].len = ARRAY_SIZE(data);
 
 	mutex_lock(&bq2415x_i2c_mutex);
-	ret = i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg));
+	ret = bq->firmware_owned ? -EBUSY : i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg));
 	mutex_unlock(&bq2415x_i2c_mutex);
 
 	/* i2c_transfer returns number of messages transferred */
@@ -734,6 +738,13 @@ static int bq2415x_set_defaults(struct bq2415x_device *bq)
 	ret = bq2415x_exec_command(bq, BQ2415X_BOOST_MODE_DISABLE);
 	if (ret < 0)
 		return ret;
+	ret = bq2415x_exec_command(bq, BQ2415X_HIGH_IMPEDANCE_DISABLE);
+	if (ret < 0)
+		return ret;
+	ret = bq2415x_exec_command(bq, BQ2415X_HIGH_IMPEDANCE_STATUS);
+	if (ret)
+		return ret < 0 ? ret : -EIO;
+
 	ret = bq2415x_exec_command(bq, BQ2415X_CHARGE_TERMINATION_DISABLE);
 	if (ret < 0)
 		return ret;
@@ -853,6 +864,8 @@ static bool bq2415x_update_reported_mode(struct bq2415x_device *bq, int mA)
 	return true;
 }
 
+static void bq2415x_energy_notify(struct bq2415x_device *bq);
+
 static int bq2415x_notifier_call(struct notifier_block *nb,
 		unsigned long val, void *v)
 {
@@ -873,6 +886,11 @@ static int bq2415x_notifier_call(struct notifier_block *nb,
 	} else if (bq->init_data.notify_device) {
 		if (strcmp(psy->desc->name, bq->init_data.notify_device) != 0)
 			return NOTIFY_OK;
+	}
+
+	if (READ_ONCE(bq->firmware_owned)) {
+		bq2415x_energy_notify(bq);
+		return NOTIFY_OK;
 	}
 
 	dev_dbg(bq->dev, "notifier call was called\n");
@@ -947,7 +965,7 @@ static void bq2415x_timer_work(struct work_struct *work)
 	int error;
 	int boost;
 
-	if (!READ_ONCE(bq->autotimer))
+	if (READ_ONCE(bq->firmware_owned) || !READ_ONCE(bq->autotimer))
 		return;
 	if (bq->battery) {
 		enum bq2415x_mode mode = bq2415x_battery_allows_charge(bq) ?
@@ -1054,6 +1072,8 @@ static void bq2415x_timer_work(struct work_struct *work)
 	schedule_delayed_work(&bq->work, BQ2415X_TIMER_TIMEOUT * HZ);
 }
 
+#include "bq2415x_energy.h"
+
 /**** power supply interface code ****/
 
 static enum power_supply_property bq2415x_power_supply_props[] = {
@@ -1069,6 +1089,10 @@ static int bq2415x_power_supply_get_property(struct power_supply *psy,
 {
 	struct bq2415x_device *bq = power_supply_get_drvdata(psy);
 	int ret;
+
+	if (READ_ONCE(bq->firmware_owned) &&
+	    (psp == POWER_SUPPLY_PROP_STATUS || psp == POWER_SUPPLY_PROP_ONLINE))
+		return bq2415x_energy_property(bq, psp, val);
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
@@ -1258,6 +1282,9 @@ static ssize_t bq2415x_sysfs_show_mode(struct device *dev,
 	struct power_supply *psy = dev_get_drvdata(dev);
 	struct bq2415x_device *bq = power_supply_get_drvdata(psy);
 	ssize_t ret = 0;
+
+	if (READ_ONCE(bq->firmware_owned))
+		return sysfs_emit(buf, "firmware\n");
 
 	if (bq->automode > 0)
 		ret += sysfs_emit_at(buf, ret, "auto (");
@@ -1796,6 +1823,10 @@ static int bq2415x_probe(struct i2c_client *client)
 	}
 	bq2415x_set_autotimer(bq, 1);
 
+	ret = bq2415x_energy_init(bq);
+	if (ret)
+		goto error_3;
+
 	dev_info(bq->dev, "driver registered\n");
 	return 0;
 
@@ -1823,11 +1854,14 @@ static void bq2415x_remove(struct i2c_client *client)
 {
 	struct bq2415x_device *bq = i2c_get_clientdata(client);
 
+	bq2415x_energy_exit(bq);
+
 	if (bq->notifier_registered)
 		power_supply_unreg_notifier(&bq->nb);
 
 	of_node_put(bq->notify_node);
 	bq2415x_power_supply_exit(bq);
+	bq2415x_energy_put(bq);
 
 	if (bq->battery)
 		bq2415x_exec_command(bq, BQ2415X_CHARGER_DISABLE);
@@ -1846,6 +1880,8 @@ static void bq2415x_remove(struct i2c_client *client)
 static void bq2415x_shutdown(struct i2c_client *client)
 {
 	struct bq2415x_device *bq = i2c_get_clientdata(client);
+
+	bq2415x_energy_shutdown(bq);
 
 	if (bq->battery) {
 		bq2415x_set_autotimer(bq, 0);

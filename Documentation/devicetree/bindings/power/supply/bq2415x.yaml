@@ -31,6 +31,18 @@ properties:
   reg:
     maxItems: 1
 
+  nokia,em-control:
+    type: boolean
+    description: |
+      Enable the exclusive firmware energy-management interface on Nokia E6.
+      The USB bq24153 at 0x6b also reserves the dynamic bq24156 at 0x6a.
+      Requires monitored-battery, ti,usb-charger-detection and nokia,em-stat-gpios. Kernel charging
+      remains active until userspace explicitly acquires both controllers.
+
+  nokia,em-stat-gpios:
+    maxItems: 1
+    description: E6 shared STAT input on RapuYama GPIO4, active high.
+
   ti,current-limit:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: initial maximum current charger can pull from power supply in mA.

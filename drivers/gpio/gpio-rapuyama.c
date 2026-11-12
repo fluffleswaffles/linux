@@ -39,10 +39,12 @@
 #include <linux/gpio/driver.h>
 #include <linux/io.h>
 #include <linux/irq.h>
+#include <linux/interrupt.h>
 #include <linux/mod_devicetable.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+#include <linux/soc/rapuyama-gpio.h>
 
 #define RY_GPIO_BANKS		7
 #define RY_GPIO_IN_BANKS	5
@@ -147,6 +149,24 @@ static int rapuyama_gpio_direction_input(struct gpio_chip *gc,
 	return 0;
 }
 
+static int rapuyama_gpio_set_config(struct gpio_chip *gc, unsigned int off,
+				    unsigned long config)
+{
+	struct rapuyama_gpio *ry = gpiochip_get_data(gc);
+	unsigned long flags;
+
+	if (pinconf_to_config_param(config) != RAPUYAMA_PIN_CONFIG_EM_STAT)
+		return -ENOTSUPP;
+	if (off != 4 || pinconf_to_config_argument(config) != 0x11)
+		return -EINVAL;
+	spin_lock_irqsave(&ry->lock, flags);
+	writel(BIT(4), ry->base + RY_IN(0) + RY_IN_DIR_IN);
+	writel(BIT(4), ry->base + 0x158);
+	ry->dir_out[0] &= ~BIT(4);
+	spin_unlock_irqrestore(&ry->lock, flags);
+	return 0;
+}
+
 static int rapuyama_gpio_direction_output(struct gpio_chip *gc,
 					  unsigned int off, int val)
 {
@@ -214,6 +234,15 @@ static void rapuyama_gpio_irq_ack(struct irq_data *d)
 	writel(ry_bit(hw), ry_irq_reg(ry, hw, RY_IRQ_ACK));
 }
 
+static int rapuyama_gpio_irq_set_state(struct irq_data *d,
+				      enum irqchip_irq_state which, bool state)
+{
+	if (which != IRQCHIP_STATE_PENDING || state)
+		return -EINVAL;
+	rapuyama_gpio_irq_ack(d);
+	return 0;
+}
+
 static int rapuyama_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 {
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
@@ -260,6 +289,7 @@ static const struct irq_chip rapuyama_gpio_irq_chip = {
 	.irq_mask		= rapuyama_gpio_irq_mask,
 	.irq_unmask		= rapuyama_gpio_irq_unmask,
 	.irq_ack		= rapuyama_gpio_irq_ack,
+	.irq_set_irqchip_state = rapuyama_gpio_irq_set_state,
 	.irq_set_type		= rapuyama_gpio_irq_set_type,
 	.flags			= IRQCHIP_IMMUTABLE,
 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
@@ -342,6 +372,7 @@ static int rapuyama_gpio_probe(struct platform_device *pdev)
 	ry->gc.ngpio = RY_GPIO_BANKS * RY_GPIO_PER_BANK;
 	ry->gc.get_direction = rapuyama_gpio_get_direction;
 	ry->gc.direction_input = rapuyama_gpio_direction_input;
+	ry->gc.set_config = rapuyama_gpio_set_config;
 	ry->gc.direction_output = rapuyama_gpio_direction_output;
 	ry->gc.get = rapuyama_gpio_get;
 	ry->gc.set = rapuyama_gpio_set;

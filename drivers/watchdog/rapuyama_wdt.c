@@ -192,6 +192,8 @@ static int rapuyama_adc_read(struct rapuyama_wdt *rw, unsigned int ch, u16 *raw)
 
 static struct rapuyama_wdt *rapuyama_pmic;
 
+#include "rapuyama_em.h"
+
 /* for drivers/power/supply/rapuyama-battery.c */
 int rapuyama_pmic_adc(unsigned int ch, u16 *raw)
 {
@@ -411,6 +413,7 @@ static struct platform_driver rapuyama_wdt_driver = {
 	.probe = rapuyama_wdt_probe,
 	.driver = {
 		.name = "rapuyama-wdt",
+		.suppress_bind_attrs = true,
 		.of_match_table = rapuyama_wdt_of_match,
 		.dev_groups = rapuyama_wdt_groups,
 	},

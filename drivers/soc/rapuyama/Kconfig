@@ -16,6 +16,23 @@ config SOC_RAPUYAMA_VIDEOCORE
 
 	  If unsure, say N.
 
+config RAPUYAMA_E5_DISPLAY
+	tristate "Nokia E5-00 RapuYama RFBI panel KMS driver"
+	depends on ARCH_RAPUYAMA && DRM && OF
+	select DRM_KMS_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select BACKLIGHT_CLASS_DEVICE
+	help
+	  KMS device (/dev/dri/card0, and /dev/fb0 + fbcon through the drm
+	  fbdev emulation) for the Nokia E5-00 320x240 command-mode panel
+	  behind the OMAP2-style RFBI that Symbian leaves set up. Changed
+	  rows are pushed to the panel by DISPC + RFBI DMA when the dt has
+	  the DISPC reg and clock, else by the CPU. Screen brightness (panel
+	  DCS 0x51) is /sys/class/backlight/panel. Binds the same dt node as
+	  FB_RAPUYAMA_E5: enable only one of them.
+
+	  If unsure, say N.
+
 config SOC_RAPUYAMA_MDI
 	tristate "Nokia E5/E6 MCU to DSP MDI descriptor transport"
 	depends on ARCH_RAPUYAMA && OF

@@ -335,6 +335,7 @@ struct drm_mode_config_funcs {
  * @output_poll_work: delayed work for polling in process context
  * @preferred_depth: preferred RBG pixel depth, used by fb helpers
  * @prefer_shadow: hint to userspace to prefer shadow-fb rendering
+ * @fbdev_defio_delay_ms: deferred-I/O flush delay of the fbdev emulation
  * @cursor_width: hint to userspace for max cursor width
  * @cursor_height: hint to userspace for max cursor height
  * @helper_private: mid-layer private data
@@ -883,6 +884,15 @@ struct drm_mode_config {
 
 	/* dumb ioctl parameters */
 	uint32_t preferred_depth, prefer_shadow;
+
+	/**
+	 * @fbdev_defio_delay_ms:
+	 *
+	 * Deferred-I/O flush delay for the fbdev emulation, in milliseconds.
+	 * 0 selects the default of 50 ms. Small panels with a slow bus may
+	 * want a smaller value.
+	 */
+	unsigned int fbdev_defio_delay_ms;
 
 	/**
 	 * @quirk_addfb_prefer_xbgr_30bpp:

@@ -161,7 +161,11 @@ static int drm_fbdev_shmem_helper_fb_probe(struct drm_fb_helper *fb_helper,
 	info->fix.smem_len = info->screen_size;
 
 	/* deferred I/O */
-	fb_helper->fbdefio.delay = HZ / 20;
+	if (dev->mode_config.fbdev_defio_delay_ms)
+		fb_helper->fbdefio.delay =
+			msecs_to_jiffies(dev->mode_config.fbdev_defio_delay_ms);
+	else
+		fb_helper->fbdefio.delay = HZ / 20;
 	fb_helper->fbdefio.get_page = drm_fbdev_shmem_get_page;
 	fb_helper->fbdefio.deferred_io = drm_fb_helper_deferred_io;
 

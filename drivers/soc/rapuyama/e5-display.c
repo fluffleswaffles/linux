@@ -168,8 +168,8 @@ struct e5d {
 	struct clk *dma_clk;	/* gfx dma clock, on during a dma push */
 	int irq;		/* DISPC irq, 0: polling only */
 	struct completion dma_done;
-	bool irq_armed;		/* a push waits on dma_done (IRQENABLE set) */
-	u32 irq_status;		/* FRAMEDONE/GFXENDWIN bits the isr acked */
+	bool dma_waiting;	/* a push waits on dma_done (IRQENABLE set) */
+	u32 dma_status;		/* FRAMEDONE/GFXENDWIN bits the isr acked, ORed */
 	u8 *vmem;		/* what the panel shows (or will after a push) */
 	dma_addr_t vmem_dma;	/* valid when dispc is set */
 	u8 *row;		/* one converted row, for the comparison */
@@ -285,9 +285,10 @@ static void e5d_dma_regs(struct e5d *e5d, const char *why)
 /*
  * DISPC irq: only ours while a push has IRQENABLE set. Spurious (nothing of
  * ours enabled and pending) -> IRQ_NONE; pending without a waiting push is
- * acked and dropped.
+ * acked and dropped. The status is ORed (FRAMEDONE and GFXENDWIN may come in
+ * two runs) and stored before the completion; only FRAMEDONE completes.
  */
-static irqreturn_t e5d_dma_isr(int irq, void *data)
+static irqreturn_t e5d_dma_interrupt(int irq, void *data)
 {
 	struct e5d *e5d = data;
 	u32 st = readl(e5d->dispc + DISPC_IRQSTATUS) &
@@ -296,11 +297,20 @@ static irqreturn_t e5d_dma_isr(int irq, void *data)
 	if (!st)
 		return IRQ_NONE;
 	writel(st, e5d->dispc + DISPC_IRQSTATUS);
-	if (READ_ONCE(e5d->irq_armed)) {
-		WRITE_ONCE(e5d->irq_status, st);
-		complete(&e5d->dma_done);
+	if (READ_ONCE(e5d->dma_waiting)) {
+		WRITE_ONCE(e5d->dma_status, READ_ONCE(e5d->dma_status) | st);
+		if (st & DISPC_IRQ_FRAMEDONE)
+			complete(&e5d->dma_done);
 	}
 	return IRQ_HANDLED;
+}
+
+/* IRQENABLE off, then no isr is running or will touch dma_status */
+static void e5d_dma_irq_off(struct e5d *e5d)
+{
+	writel(0, e5d->dispc + DISPC_IRQENABLE);
+	synchronize_irq(e5d->irq);
+	WRITE_ONCE(e5d->dma_waiting, false);
 }
 
 /* DMA path (d_display.ldd 0x80180498), push_lock held. false: not pushed */
@@ -310,6 +320,7 @@ static bool e5d_push_dma(struct e5d *e5d, dma_addr_t src, u32 x0, u32 y0,
 	void __iomem *d = e5d->dispc;
 	u32 w = x1 - x0, h = y1 - y0, size = (h - 1) << 16 | (w - 1);
 	bool use_irq = dma_irq && e5d->irq;
+	bool irq_on = false;	/* IRQENABLE set, dma_waiting */
 	u32 v;
 
 	if (readl(d + DISPC_CONTROL) & DISPC_CONTROL_LCDENABLE) {
@@ -327,8 +338,10 @@ static bool e5d_push_dma(struct e5d *e5d, dma_addr_t src, u32 x0, u32 y0,
 	writel(E5D_DMA_IRQS, d + DISPC_IRQSTATUS);
 	if (use_irq) {
 		reinit_completion(&e5d->dma_done);
-		WRITE_ONCE(e5d->irq_armed, true);
+		WRITE_ONCE(e5d->dma_status, 0);
+		WRITE_ONCE(e5d->dma_waiting, true);
 		writel(E5D_DMA_IRQS, d + DISPC_IRQENABLE);
+		irq_on = true;
 	}
 
 	writel(src + y0 * E5D_STRIDE + x0 * E5D_CPP, d + DISPC_GFX_BA0);
@@ -354,13 +367,13 @@ static bool e5d_push_dma(struct e5d *e5d, dma_addr_t src, u32 x0, u32 y0,
 		bool got = wait_for_completion_timeout(&e5d->dma_done,
 					msecs_to_jiffies(dma_irq_timeout_ms));
 
-		/* off before looking again: no isr runs past this point */
-		writel(0, d + DISPC_IRQENABLE);
-		synchronize_irq(e5d->irq);
-		WRITE_ONCE(e5d->irq_armed, false);
+		e5d_dma_irq_off(e5d);
+		irq_on = false;
 		if (!got)
 			got = try_wait_for_completion(&e5d->dma_done);
-		v = got ? READ_ONCE(e5d->irq_status) : readl(d + DISPC_IRQSTATUS);
+		v = READ_ONCE(e5d->dma_status);
+		if (!got)
+			v |= readl(d + DISPC_IRQSTATUS);
 		if (!got) {
 			/* never again; the push itself is still checked by polling */
 			dev_warn(e5d->dev, "no dma irq within %u ms (raw irqstatus %#x), polling from now on\n",
@@ -388,11 +401,8 @@ static bool e5d_push_dma(struct e5d *e5d, dma_addr_t src, u32 x0, u32 y0,
 	e5d_wait(e5d);
 	writel(E5D_DMA_IRQS, d + DISPC_IRQSTATUS);
 stop:
-	if (use_irq) {		/* the early exits above leave it armed */
-		writel(0, d + DISPC_IRQENABLE);
-		synchronize_irq(e5d->irq);
-		WRITE_ONCE(e5d->irq_armed, false);
-	}
+	if (irq_on)		/* only the early exits get here still armed */
+		e5d_dma_irq_off(e5d);
 	writel(readl(e5d->rfbi + RFBI_CONTROL) &
 	       ~(RFBI_CONTROL_ENABLE | RFBI_CONTROL_ITE), e5d->rfbi + RFBI_CONTROL);
 	if (e5d->dma_broken)
@@ -950,7 +960,7 @@ static int e5d_probe(struct platform_device *pdev)
 			/* nothing enabled until a push; symbian may have left bits set */
 			writel(0, e5d->dispc + DISPC_IRQENABLE);
 			writel(E5D_DMA_IRQS, e5d->dispc + DISPC_IRQSTATUS);
-			ret = devm_request_irq(dev, irq, e5d_dma_isr, 0,
+			ret = devm_request_irq(dev, irq, e5d_dma_interrupt, 0,
 					       "e5-display", e5d);
 			if (ret) {
 				dev_warn(dev, "dispc irq %d unavailable (%d), completion by polling\n",

@@ -25,13 +25,14 @@
  * fetches the rectangle from vmem and feeds RFBI in stall mode, as
  * d_display.ldd's push (ROM 0x80180498, DISPC part 0x801791d0) does: GFX_BA0
  * = rect start, GFX_POSITION 0, GFX_SIZE = SIZE_LCD = (h-1)<<16 | (w-1),
- * GFX_ROW_INC = stride - w*4 + 1, GFX_PIXEL_INC 1, CONTROL |= GOLCD then |=
+ * GFX_ROW_INC = stride - w*cpp + 1, GFX_PIXEL_INC 1, CONTROL |= GOLCD then |=
  * LCDENABLE, 13 us, window + PIXEL_CNT = w*h, RAMWR, RFBI CONTROL |= ENABLE |
  * ITE; done at DISPC FRAMEDONE (IRQSTATUS bit 0; irq 146 with FRAMEDONE |
  * GFXENDWIN in IRQENABLE during the push, dma_irq=0 or a missing irq polls it;
  * an irq wait timeout logs once and polls from then on), then RFBI
  * CONTROL &= ~0x11 (the firmware's stop, 0x8018060c). Symbian's DISPC setup
- * is kept: stall mode, GFX format 8 (xRGB8888, = vmem), 24 data lines. A
+ * is kept: stall mode, GFX format 8 (xRGB8888, = vmem; rgb565: see below),
+ * 24 data lines. A
  * timeout logs the registers and falls back to the CPU path for good. The
  * DMA needs the ViSSI clock (power resource 0x18 = cgc gate 0x17), which is
  * on only during a push, as in the firmware.
@@ -51,6 +52,17 @@
  * rows 120..239) and overlay_on attributes, i.e.
  * /sys/class/graphics/fb0/device/overlay as with the fbdev driver. While it
  * is on, those rows are pushed from the overlay instead of vmem.
+ *
+ * rgb565=1 (16 bpp, issue #5; the E6's videocore.rgb565): the plane also
+ * offers RGB565 and the fbdev emulation is 16 bpp, so SDL 1.2 gets a native
+ * 16 bpp /dev/fb0. vmem is RGB565 too (XRGB8888 planes converted per row),
+ * the DISPC fetches it as GFX format 6 (RGB16; written to GFX_ATTRIBUTES at
+ * probe, the only time this driver touches the format), the CPU path sends
+ * it as R,G,B bytes, and the overlay (still written as XRGB8888) is kept in
+ * a converted copy for the pushes. fmt16_fetch=0 is the fallback if the GFX
+ * plane cannot fetch format 6: vmem stays XRGB8888 (RGB565 rows converted
+ * into it) and Symbian's format 8 is left alone. rgb565=0 never writes the
+ * format field either.
  */
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -68,6 +80,7 @@
 #include <drm/drm_rect.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <linux/backlight.h>
+#include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/completion.h>
@@ -90,12 +103,13 @@
 #include "e5-display-core.h"
 
 #define E5D_WIDTH		320
-#define E5D_CPP			4
-#define E5D_STRIDE		(E5D_WIDTH * E5D_CPP)
-#define E5D_SIZE		(E5D_STRIDE * E5D_HEIGHT)
+/* vmem: e5d->cpp bytes a pixel, 4 (XRGB8888) or 2 (RGB565, rgb565 mode) */
+#define E5D_XRGB_CPP		4
 /* overlay (e5-keyd's key picture): opaque, the bottom half of the panel */
 #define E5D_OVL_Y		120
-#define E5D_OVL_SIZE		(E5D_STRIDE * (E5D_HEIGHT - E5D_OVL_Y))
+#define E5D_OVL_ROWS		(E5D_HEIGHT - E5D_OVL_Y)
+/* what e5-keyd writes, XRGB8888 in every mode */
+#define E5D_OVL_SIZE		(E5D_WIDTH * E5D_XRGB_CPP * E5D_OVL_ROWS)
 
 /* RFBI registers (OMAP2 layout, offsets used by d_display.ldd) */
 #define RFBI_SYSSTATUS		0x14
@@ -119,6 +133,10 @@
 #define DISPC_GFX_BA0		0x80
 #define DISPC_GFX_POSITION	0x88
 #define DISPC_GFX_SIZE		0x8c
+#define DISPC_GFX_ATTRIBUTES	0xa0
+#define  DISPC_GFX_FORMAT_MASK	GENMASK(4, 1)
+#define  DISPC_GFX_FORMAT_RGB16	6	/* RGB565 */
+#define  DISPC_GFX_FORMAT_RGB24	8	/* xRGB8888 unpacked, Symbian's */
 #define DISPC_GFX_ROW_INC	0xac
 #define DISPC_GFX_PIXEL_INC	0xb0
 
@@ -153,6 +171,14 @@ static bool dma_irq = true;
 module_param(dma_irq, bool, 0644);
 MODULE_PARM_DESC(dma_irq, "wait for the dma push on DISPC IRQ 146 instead of polling IRQSTATUS (default on; a timeout switches it off)");
 
+static bool rgb565;
+module_param(rgb565, bool, 0444);
+MODULE_PARM_DESC(rgb565, "16 bpp: RGB565 plane + 16 bpp /dev/fb0, 16 bit buffer and dma fetch (default off)");
+
+static bool fmt16_fetch = true;
+module_param(fmt16_fetch, bool, 0444);
+MODULE_PARM_DESC(fmt16_fetch, "with rgb565: dma fetches RGB565 (GFX format 6); 0 keeps the buffer XRGB8888 (format 8) and converts rows (default on)");
+
 static unsigned int dma_irq_timeout_ms = 200;
 module_param(dma_irq_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(dma_irq_timeout_ms, "how long a push waits for the irq before falling back to polling (default 200; 1 forces the fallback)");
@@ -170,12 +196,15 @@ struct e5d {
 	struct completion dma_done;
 	bool dma_waiting;	/* a push waits on dma_done (IRQENABLE set) */
 	u32 dma_status;		/* FRAMEDONE/GFXENDWIN bits the isr acked, ORed */
+	u32 cpp, stride;	/* vmem and ovl_px format: 4 or 2 (16 bit fetch) */
 	u8 *vmem;		/* what the panel shows (or will after a push) */
 	dma_addr_t vmem_dma;	/* valid when dispc is set */
 	u8 *row;		/* one converted row, for the comparison */
 	struct mutex fb_lock;	/* vmem writes, row */
-	u8 *ovl;		/* rows E5D_OVL_Y.. while ovl_on, instead of vmem */
-	dma_addr_t ovl_dma;	/* valid when dispc is set */
+	u8 *ovl;		/* the overlay as written (XRGB8888) */
+	u8 *ovl_px;		/* in vmem's format (= ovl at cpp 4): rows
+				 * E5D_OVL_Y.. while ovl_on, instead of vmem */
+	dma_addr_t ovl_dma;	/* ovl_px, valid when dispc is set */
 	bool ovl_on;		/* push_lock */
 
 	/* rows to push; the thread takes them */
@@ -260,10 +289,10 @@ static void e5d_push_cpu(struct e5d *e5d, const u8 *src, u32 x0, u32 y0,
 		return;
 
 	for (y = y0; y < y1; y++) {
-		const u32 *p = (const u32 *)(src + y * E5D_STRIDE) + x0;
+		const u8 *p = src + y * e5d->stride + x0 * e5d->cpp;
 
-		for (x = x0; x < x1; x++, p++) {
-			u32 v = READ_ONCE(*p);
+		for (x = x0; x < x1; x++, p += e5d->cpp) {
+			u32 v = e5d_read_px(p, e5d->cpp);
 
 			if (!e5d_param(e5d, v >> 16) || !e5d_param(e5d, v >> 8) ||
 			    !e5d_param(e5d, v))
@@ -333,8 +362,8 @@ static bool e5d_push_dma(struct e5d *e5d, dma_addr_t src, u32 x0, u32 y0,
 		return false;
 	}
 	/* the cpu cache (commit copies, overlay writes) to ram */
-	dma_sync_single_for_device(e5d->dev, src + y0 * E5D_STRIDE,
-				   h * E5D_STRIDE, DMA_TO_DEVICE);
+	dma_sync_single_for_device(e5d->dev, src + y0 * e5d->stride,
+				   h * e5d->stride, DMA_TO_DEVICE);
 	writel(E5D_DMA_IRQS, d + DISPC_IRQSTATUS);
 	if (use_irq) {
 		reinit_completion(&e5d->dma_done);
@@ -344,11 +373,11 @@ static bool e5d_push_dma(struct e5d *e5d, dma_addr_t src, u32 x0, u32 y0,
 		irq_on = true;
 	}
 
-	writel(src + y0 * E5D_STRIDE + x0 * E5D_CPP, d + DISPC_GFX_BA0);
+	writel(src + y0 * e5d->stride + x0 * e5d->cpp, d + DISPC_GFX_BA0);
 	writel(0, d + DISPC_GFX_POSITION);
 	writel(size, d + DISPC_GFX_SIZE);
 	writel(size, d + DISPC_SIZE_LCD);
-	writel(E5D_STRIDE - w * E5D_CPP + 1, d + DISPC_GFX_ROW_INC);
+	writel(e5d->stride - w * e5d->cpp + 1, d + DISPC_GFX_ROW_INC);
 	writel(1, d + DISPC_GFX_PIXEL_INC);
 	writel(readl(d + DISPC_CONTROL) | DISPC_CONTROL_GOLCD, d + DISPC_CONTROL);
 	writel(readl(d + DISPC_CONTROL) | DISPC_CONTROL_LCDENABLE, d + DISPC_CONTROL);
@@ -443,13 +472,13 @@ static void e5d_push(struct e5d *e5d, u32 x0, u32 y0, u32 x1, u32 y1)
 	if (e5d->dead || e5d->asleep)
 		goto out;
 	if (e5d->ovl_on && y1 > E5D_OVL_Y) {
-		const u32 skip = E5D_OVL_Y * E5D_STRIDE;
+		const u32 skip = E5D_OVL_Y * e5d->stride;
 
 		if (y0 < E5D_OVL_Y)
 			e5d_push_src(e5d, e5d->vmem, e5d->vmem_dma, x0, y0, x1, E5D_OVL_Y);
 		if (e5d->dead)
 			goto out;
-		use_dma = e5d_push_src(e5d, e5d->ovl - skip, e5d->ovl_dma - skip, x0,
+		use_dma = e5d_push_src(e5d, e5d->ovl_px - skip, e5d->ovl_dma - skip, x0,
 				       max_t(u32, y0, E5D_OVL_Y), x1, y1);
 	} else {
 		use_dma = e5d_push_src(e5d, e5d->vmem, e5d->vmem_dma, x0, y0, x1, y1);
@@ -592,7 +621,7 @@ static void e5d_copy_plane(struct e5d *e5d, struct drm_plane_state *state,
 		return;
 	if (!drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE)) {
 		mutex_lock(&e5d->fb_lock);
-		e5d_copy_rows(e5d->vmem, E5D_STRIDE, E5D_CPP, s, fb->pitches[0],
+		e5d_copy_rows(e5d->vmem, e5d->stride, e5d->cpp, s, fb->pitches[0],
 			      cpp, rect.x1, rect.x2, rect.y1, rect.y2, e5d->row,
 			      &changed);
 		mutex_unlock(&e5d->fb_lock);
@@ -661,7 +690,8 @@ static const struct drm_simple_display_pipe_funcs e5d_pipe_funcs = {
 	DRM_GEM_SIMPLE_DISPLAY_PIPE_SHADOW_PLANE_FUNCS,
 };
 
-static const u32 e5d_formats[] = { DRM_FORMAT_XRGB8888 };
+/* RGB565 only in rgb565 mode */
+static const u32 e5d_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_RGB565 };
 static const u64 e5d_modifiers[] = { DRM_FORMAT_MOD_LINEAR,
 				     DRM_FORMAT_MOD_INVALID };
 
@@ -714,7 +744,7 @@ static int e5d_drm_init(struct e5d *e5d)
 		return ret;
 	drm->mode_config.min_width = drm->mode_config.max_width = E5D_WIDTH;
 	drm->mode_config.min_height = drm->mode_config.max_height = E5D_HEIGHT;
-	drm->mode_config.preferred_depth = 24;
+	drm->mode_config.preferred_depth = rgb565 ? 16 : 24;
 	drm->mode_config.funcs = &e5d_mode_config_funcs;
 	/*
 	 * mmap writers of /dev/fb0 (X fbdev, SDL 1.2): the fbdev driver's
@@ -728,7 +758,7 @@ static int e5d_drm_init(struct e5d *e5d)
 	if (ret)
 		return ret;
 	ret = drm_simple_display_pipe_init(drm, &e5d->pipe, &e5d_pipe_funcs,
-					   e5d_formats, ARRAY_SIZE(e5d_formats),
+					   e5d_formats, rgb565 ? 2 : 1,
 					   e5d_modifiers, &e5d->conn);
 	if (ret)
 		return ret;
@@ -771,8 +801,10 @@ static void e5d_ovl_damage(struct e5d *e5d)
 
 /*
  * overlay: the picture for rows E5D_OVL_Y..E5D_HEIGHT-1, xrgb8888, stride
- * E5D_STRIDE, written in one go or in chunks (sysfs splits big writes);
- * shown after the chunk that ends at E5D_OVL_SIZE
+ * E5D_WIDTH * 4 in every mode, written in one go or in chunks (sysfs splits
+ * big writes); shown after the chunk that ends at E5D_OVL_SIZE. At cpp 2 the
+ * pixels a chunk touches are converted into ovl_px (one cut by the chunk end
+ * is converted again with the next chunk).
  */
 static ssize_t overlay_write(struct file *file, struct kobject *kobj,
 			     struct bin_attribute *attr, char *buf,
@@ -786,6 +818,14 @@ static ssize_t overlay_write(struct file *file, struct kobject *kobj,
 		return -EINVAL;
 	mutex_lock(&e5d->push_lock);
 	memcpy(e5d->ovl + off, buf, count);
+	if (e5d->ovl_px != e5d->ovl) {
+		u32 i, end = DIV_ROUND_UP(off + count, E5D_XRGB_CPP);
+
+		for (i = off / E5D_XRGB_CPP; i < end; i++)
+			e5d_write_px(e5d->ovl_px + i * e5d->cpp, e5d->cpp,
+				     e5d_read_px(e5d->ovl + i * E5D_XRGB_CPP,
+						 E5D_XRGB_CPP));
+	}
 	mutex_unlock(&e5d->push_lock);
 	if (off + count == E5D_OVL_SIZE && READ_ONCE(e5d->ovl_on))
 		e5d_ovl_damage(e5d);
@@ -841,15 +881,20 @@ __ATTRIBUTE_GROUPS(e5d);
 
 static void e5d_free_bufs(struct e5d *e5d)
 {
-	if (e5d->ovl && e5d->dispc)
-		dma_unmap_single(e5d->dev, e5d->ovl_dma, E5D_OVL_SIZE, DMA_TO_DEVICE);
+	u32 size = e5d->stride * E5D_HEIGHT;
+
+	if (e5d->ovl_px && e5d->dispc)
+		dma_unmap_single(e5d->dev, e5d->ovl_dma, e5d->stride * E5D_OVL_ROWS,
+				 DMA_TO_DEVICE);
+	if (e5d->ovl_px != e5d->ovl)
+		kfree(e5d->ovl_px);
 	kfree(e5d->ovl);
 	kfree(e5d->row);
 	if (!e5d->vmem)
 		return;
 	if (e5d->dispc) {
-		dma_unmap_single(e5d->dev, e5d->vmem_dma, E5D_SIZE, DMA_TO_DEVICE);
-		free_pages_exact(e5d->vmem, PAGE_ALIGN(E5D_SIZE));
+		dma_unmap_single(e5d->dev, e5d->vmem_dma, size, DMA_TO_DEVICE);
+		free_pages_exact(e5d->vmem, PAGE_ALIGN(size));
 	} else {
 		vfree(e5d->vmem);
 	}
@@ -859,16 +904,18 @@ static void e5d_free_bufs(struct e5d *e5d)
 static int e5d_alloc_bufs(struct e5d *e5d)
 {
 	struct device *dev = e5d->dev;
+	u32 size = e5d->stride * E5D_HEIGHT;
+	u32 ovl_px_size = e5d->stride * E5D_OVL_ROWS;
 
 	if (e5d->dispc) {
 		/* DISPC reads it: physically contiguous, cached + streaming sync */
-		e5d->vmem = alloc_pages_exact(PAGE_ALIGN(E5D_SIZE),
+		e5d->vmem = alloc_pages_exact(PAGE_ALIGN(size),
 					      GFP_KERNEL | __GFP_ZERO);
 		if (e5d->vmem) {
-			e5d->vmem_dma = dma_map_single(dev, e5d->vmem, E5D_SIZE,
+			e5d->vmem_dma = dma_map_single(dev, e5d->vmem, size,
 						       DMA_TO_DEVICE);
 			if (dma_mapping_error(dev, e5d->vmem_dma)) {
-				free_pages_exact(e5d->vmem, PAGE_ALIGN(E5D_SIZE));
+				free_pages_exact(e5d->vmem, PAGE_ALIGN(size));
 				e5d->vmem = NULL;
 			}
 		}
@@ -878,21 +925,59 @@ static int e5d_alloc_bufs(struct e5d *e5d)
 		}
 	}
 	if (!e5d->vmem)
-		e5d->vmem = vzalloc(PAGE_ALIGN(E5D_SIZE));
-	e5d->row = kmalloc(E5D_STRIDE, GFP_KERNEL);
+		e5d->vmem = vzalloc(PAGE_ALIGN(size));
+	e5d->row = kmalloc(e5d->stride, GFP_KERNEL);
 	if (!e5d->vmem || !e5d->row)
 		return -ENOMEM;
-	/* overlay: kmalloc is contiguous at this size; optional (sysfs -ENOMEM) */
+	/*
+	 * overlay: kmalloc is contiguous at these sizes; optional (sysfs
+	 * -ENOMEM). At cpp 2 the pushes use a converted copy.
+	 */
 	e5d->ovl = kzalloc(E5D_OVL_SIZE, GFP_KERNEL);
-	if (e5d->ovl && e5d->dispc) {
-		e5d->ovl_dma = dma_map_single(dev, e5d->ovl, E5D_OVL_SIZE,
+	if (!e5d->ovl)
+		return 0;
+	e5d->ovl_px = e5d->cpp == E5D_XRGB_CPP ? e5d->ovl :
+		      kzalloc(ovl_px_size, GFP_KERNEL);
+	if (e5d->ovl_px && e5d->dispc) {
+		e5d->ovl_dma = dma_map_single(dev, e5d->ovl_px, ovl_px_size,
 					      DMA_TO_DEVICE);
 		if (dma_mapping_error(dev, e5d->ovl_dma)) {
-			kfree(e5d->ovl);
-			e5d->ovl = NULL;
+			if (e5d->ovl_px != e5d->ovl)
+				kfree(e5d->ovl_px);
+			e5d->ovl_px = NULL;
 		}
 	}
+	if (!e5d->ovl_px) {
+		kfree(e5d->ovl);
+		e5d->ovl = NULL;
+	}
 	return 0;
+}
+
+/*
+ * rgb565 with the 16 bit fetch: GFX format 6 (RGB16) instead of Symbian's 8.
+ * Shadowed, latched by the GOLCD of the first push. Not called otherwise:
+ * the format field stays as Symbian left it.
+ */
+static void e5d_set_gfx_format16(struct e5d *e5d)
+{
+	void __iomem *a = e5d->dispc + DISPC_GFX_ATTRIBUTES;
+	u32 old, v;
+
+	if (clk_enable(e5d->dma_clk)) {
+		dev_err(e5d->dev, "dma clock enable failed, cpu path\n");
+		e5d->dma_broken = true;
+		return;
+	}
+	old = readl(a);
+	v = (old & ~DISPC_GFX_FORMAT_MASK) |
+	    FIELD_PREP(DISPC_GFX_FORMAT_MASK, DISPC_GFX_FORMAT_RGB16);
+	writel(v, a);
+	clk_disable(e5d->dma_clk);
+	if (FIELD_GET(DISPC_GFX_FORMAT_MASK, old) != DISPC_GFX_FORMAT_RGB24)
+		dev_warn(e5d->dev, "gfx format was %lu, not %u\n",
+			 FIELD_GET(DISPC_GFX_FORMAT_MASK, old), DISPC_GFX_FORMAT_RGB24);
+	dev_info(e5d->dev, "gfx attributes %#x -> %#x (format 6, rgb16)\n", old, v);
 }
 
 static void e5d_debugfs_init(struct e5d *e5d)
@@ -918,6 +1003,8 @@ static int e5d_probe(struct platform_device *pdev)
 	if (IS_ERR(e5d))
 		return PTR_ERR(e5d);
 	e5d->dev = dev;
+	e5d->cpp = rgb565 && fmt16_fetch ? 2 : E5D_XRGB_CPP;
+	e5d->stride = E5D_WIDTH * e5d->cpp;
 	mutex_init(&e5d->fb_lock);
 	mutex_init(&e5d->push_lock);
 	spin_lock_init(&e5d->band_lock);
@@ -947,6 +1034,8 @@ static int e5d_probe(struct platform_device *pdev)
 	ret = e5d_alloc_bufs(e5d);
 	if (ret)
 		goto err_bufs;
+	if (e5d->dispc && e5d->cpp == 2)
+		e5d_set_gfx_format16(e5d);
 
 	/* DISPC irq, optional: without it (or if the request fails) polling */
 	if (e5d->dispc && dma_irq) {
@@ -1004,12 +1093,14 @@ static int e5d_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_thread;
 	/* fbcon and /dev/fb0 through the drm fbdev emulation */
-	drm_fbdev_shmem_setup(&e5d->drm, 32);
+	drm_fbdev_shmem_setup(&e5d->drm, rgb565 ? 16 : 32);
 	e5d_debugfs_init(e5d);
 
-	dev_info(dev, "%ux%u xrgb8888, rfbi cpu path%s\n", E5D_WIDTH,
-		 E5D_HEIGHT, e5d->dispc ? (e5d->irq && dma_irq ? " + dispc dma (irq)" :
-					   " + dispc dma (polled)") : "");
+	dev_info(dev, "%ux%u %s (buffer %s), rfbi cpu path%s\n", E5D_WIDTH,
+		 E5D_HEIGHT, rgb565 ? "rgb565" : "xrgb8888",
+		 e5d->cpp == 2 ? "rgb565" : "xrgb8888",
+		 e5d->dispc ? (e5d->irq && dma_irq ? " + dispc dma (irq)" :
+			       " + dispc dma (polled)") : "");
 	return 0;
 
 err_thread:

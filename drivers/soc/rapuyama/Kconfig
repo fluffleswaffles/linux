@@ -19,6 +19,7 @@ config SOC_RAPUYAMA_VIDEOCORE
 config RAPUYAMA_E5_DISPLAY
 	tristate "Nokia E5-00 RapuYama RFBI panel KMS driver"
 	depends on ARCH_RAPUYAMA && DRM && OF
+	depends on !FB_RAPUYAMA_E5
 	select DRM_KMS_HELPER
 	select DRM_GEM_SHMEM_HELPER
 	select BACKLIGHT_CLASS_DEVICE
@@ -29,7 +30,7 @@ config RAPUYAMA_E5_DISPLAY
 	  rows are pushed to the panel by DISPC + RFBI DMA when the dt has
 	  the DISPC reg and clock, else by the CPU. Screen brightness (panel
 	  DCS 0x51) is /sys/class/backlight/panel. Binds the same dt node as
-	  FB_RAPUYAMA_E5: enable only one of them.
+	  FB_RAPUYAMA_E5, so only one of the two can be enabled.
 
 	  If unsure, say N.
 

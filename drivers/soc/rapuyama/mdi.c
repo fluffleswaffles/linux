@@ -266,6 +266,53 @@ free:
 	return ret;
 }
 
+static int mdi_dsp_copy(struct mdi_file *context, const void __user *argument,	bool to_dsp)
+{
+	struct rapuyama_mdi *mdi = context->mdi;
+	struct rapuyama_mdi_buffer buffer;
+	void *copy;
+	int ret;
+
+	if (copy_from_user(&buffer, argument, sizeof(buffer)))
+		return -EFAULT;
+	if (!buffer.size || buffer.size > (to_dsp ? 4096 : 8192) ||
+	    buffer.offset >= MDI_DSP_SIZE ||
+	    buffer.size > MDI_DSP_SIZE - buffer.offset)
+		return -EINVAL;
+	if (context->mm != current->mm)
+		return -EXDEV;
+	if (to_dsp) {
+		copy = memdup_user(u64_to_user_ptr(buffer.buffer), buffer.size);
+		if (IS_ERR(copy))
+			return PTR_ERR(copy);
+	} else {
+		copy = kmalloc(buffer.size, GFP_KERNEL);
+		if (!copy)
+			return -ENOMEM;
+	}
+	ret = mutex_lock_interruptible(&mdi->io);
+	if (ret)
+		goto free;
+	if (mdi->dying)
+		ret = -ENODEV;
+	else if (!context->buffers || !mdi->dsp_memory)
+		ret = -EINVAL;
+	else if (to_dsp) {
+		memcpy_toio(mdi->dsp_memory + buffer.offset, copy, buffer.size);
+		wmb();
+	} else {
+		rmb();
+		memcpy_fromio(copy, mdi->dsp_memory + buffer.offset, buffer.size);
+	}
+	mutex_unlock(&mdi->io);
+	if (!ret && !to_dsp &&
+	    copy_to_user(u64_to_user_ptr(buffer.buffer), copy, buffer.size))
+		ret = -EFAULT;
+free:
+	kfree(copy);
+	return ret;
+}
+
 static ssize_t mdi_read(struct file *file, char __user *buffer, size_t count,
 			loff_t *offset)
 {
@@ -522,6 +569,10 @@ static long mdi_ioctl(struct file *file, unsigned int command,
 		ret = 0;
 		goto unlock;
 	}
+	if (command == RAPUYAMA_MDI_DSP_PUT ||
+	    command == RAPUYAMA_MDI_DSP_GET)
+		return mdi_dsp_copy(context, (void __user *)argument,
+				    command == RAPUYAMA_MDI_DSP_PUT);
 	if (command != RAPUYAMA_MDI_STATUS)
 		return -ENOTTY;
 	ret = mutex_lock_interruptible(&mdi->io);

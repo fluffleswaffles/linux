@@ -17,4 +17,12 @@ struct rapuyama_mdi_status {
 #define RAPUYAMA_MDI_STATUS	_IOR('M', 0, struct rapuyama_mdi_status)
 #define RAPUYAMA_MDI_BUFFERS	_IOW('M', 1, __u32)
 
+struct rapuyama_mdi_buffer {
+	__u32 offset;
+	__u32 size;
+	__u64 buffer;
+};
+#define RAPUYAMA_MDI_DSP_PUT	_IOW('M', 2, struct rapuyama_mdi_buffer)
+#define RAPUYAMA_MDI_DSP_GET	_IOW('M', 3, struct rapuyama_mdi_buffer)
+
 #endif

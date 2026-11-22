@@ -515,9 +515,20 @@ static int __init rapuyama_intc_of_init(struct device_node *node,
  * asserting at init = storm sources) and ACK them every 10 ms, which is the
  * "APE is alive and serviced your IPC" signal. ACK is a background poll so it
  * works even if the aggregate main line gets masked.
+ *
+ * Off by default (22.11.2026): once armed, the DSP stops getting a timing fix
+ * on its idle wakes for as long as the phone runs (the fine part of the wake
+ * step at dsp sram +0xe28 clamps at +-51, then stays 0), and the serving cell
+ * is lost (3a/1d 0x98) every ~30 s. Without it the DSP tracks like on Symbian
+ * and a 331 s idle run had no loss and no resync. The isasw runtime keeps the
+ * modem alive now, the ~210 s reset did not come back. sec_service=1 turns it
+ * back on.
  */
 #define SEC_SVC_DELAY_MS	3000
 #define SEC_POLL_MS		10
+
+static bool sec_service;
+module_param(sec_service, bool, 0444);
 
 static void rapuyama_sec_work_fn(struct work_struct *w)
 {
@@ -549,7 +560,7 @@ static void rapuyama_sec_work_fn(struct work_struct *w)
 
 static int __init rapuyama_sec_service_start(void)
 {
-	if (!intc_sec)
+	if (!intc_sec || !sec_service)
 		return 0;
 	INIT_DELAYED_WORK(&sec_work, rapuyama_sec_work_fn);
 	schedule_delayed_work(&sec_work, msecs_to_jiffies(SEC_SVC_DELAY_MS));

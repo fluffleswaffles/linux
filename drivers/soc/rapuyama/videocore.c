@@ -239,6 +239,28 @@ struct vc_bulk_req {
 
 struct vc_khrn_req;
 
+/* Buffered boot diagnostics: no printk or extra bus reads during the exchange.
+ * This instrumentation coincided with 16/16 successful boots on an E6 that
+ * previously failed roughly 3/4 of the time. The cause is not established:
+ * these writes change timing and the buffers change memory layout. Preserve
+ * both until the startup failure is understood; this is not a proven fix.
+ * Keep the first 16 and last 240 status samples, plus each received boot packet.
+ */
+struct vc_boot_status {
+	u32 seq, ticks, previous, raw_a, raw_b, a, b, stage, flags;
+	int ret;
+};
+
+struct vc_boot_chunk {
+	u32 stage, status, offset, count;
+};
+
+struct vc_boot_packet {
+	u32 len;
+	int ret;
+	u8 data[0x1100];
+};
+
 struct vc {
 	struct device *dev;
 	void __iomem *bus;
@@ -265,6 +287,13 @@ struct vc {
 
 	u32 last_status;
 	bool rx_armed;
+
+	bool boot_trace;
+	u32 boot_stage, boot_status_count, boot_chunk_count, boot_received;
+	unsigned long boot_started;
+	struct vc_boot_status boot_status[256];
+	struct vc_boot_chunk boot_chunks[16];
+	struct vc_boot_packet boot_packets[4];
 
 	/* VCHI */
 	u8 rx[0x1100];
@@ -395,18 +424,23 @@ static int vc_rd16(struct vc *vc, u32 *v)
  */
 static int vc_status(struct vc *vc, u32 *st)
 {
-	u32 a, b;
+	u32 a = 0, b = 0, raw_a, raw_b, flags = 0;
+	u32 previous = vc->last_status;
 	int ret;
 
 	vc_wr(vc, VC_MODE, VC_MODE_STATUS);
 	ret = vc_rd16(vc, &a);
 	if (!ret)
 		ret = vc_rd16(vc, &b);
+	raw_a = a;
+	raw_b = b;
 	if (!ret && (a & 0x8000)) {
+		flags |= 1;
 		a = b;
 		ret = vc_rd16(vc, &b);
 	}
 	if (!ret && (b & 0x4000) && !(vc->last_status & VC_ST_DATA)) {
+		flags |= 2;
 		ret = vc_rd16(vc, &a);
 		if (!ret)
 			ret = vc_rd16(vc, &b);
@@ -414,6 +448,18 @@ static int vc_status(struct vc *vc, u32 *st)
 	if (!ret)
 		*st = vc->last_status = a | b << 15;
 	vc_wr(vc, VC_MODE, VC_MODE_DATA);
+	if (vc->boot_trace) {
+		u32 seq = vc->boot_status_count++;
+		u32 slot = seq < 16 ? seq : 16 + (seq - 16) % 240;
+		struct vc_boot_status *s = &vc->boot_status[slot];
+
+		*s = (struct vc_boot_status) {
+			.seq = seq, .ticks = jiffies - vc->boot_started,
+			.previous = previous, .raw_a = raw_a, .raw_b = raw_b,
+			.a = a, .b = b, .stage = vc->boot_stage,
+			.flags = flags, .ret = ret,
+		};
+	}
 	return ret;
 }
 
@@ -773,6 +819,15 @@ static int vc_rx(struct vc *vc, u8 *buf, u32 max, u32 *len,
 		}
 		n = (st & VC_ST_LEN) + 1;
 		c = min(n, 0x800u);
+		if (vc->boot_trace) {
+			u32 slot = vc->boot_chunk_count++;
+
+			if (slot < ARRAY_SIZE(vc->boot_chunks))
+				vc->boot_chunks[slot] = (struct vc_boot_chunk) {
+					.stage = vc->boot_stage, .status = st,
+					.offset = got, .count = c,
+				};
+		}
 		if (got + c > max)
 			return -EOVERFLOW;
 		for (i = 0; i < c; i += 2) {
@@ -782,6 +837,8 @@ static int vc_rx(struct vc *vc, u8 *buf, u32 max, u32 *len,
 			buf[got + i] = v;
 			if (i + 1 < c)
 				buf[got + i + 1] = v >> 8;
+			if (vc->boot_trace)
+				vc->boot_received = got + min(i + 2, c);
 		}
 		got += c;
 		first = false;
@@ -801,10 +858,22 @@ static int vc_rx(struct vc *vc, u8 *buf, u32 max, u32 *len,
 static int vc_rx_boot(struct vc *vc, u32 *type, u32 *value)
 {
 	__le32 *w = (__le32 *)vc->rx;
-	u32 n;
+	struct vc_boot_packet *packet = NULL;
+	u32 n = 0;
 	int ret;
 
+	if (vc->boot_trace) {
+		if (vc->boot_stage < ARRAY_SIZE(vc->boot_packets))
+			packet = &vc->boot_packets[vc->boot_stage];
+		vc->boot_stage++;
+		vc->boot_received = 0;
+	}
 	ret = vc_rx(vc, vc->rx, sizeof(vc->rx), &n, 2000);
+	if (packet) {
+		packet->ret = ret;
+		packet->len = ret ? vc->boot_received : n;
+		memcpy(packet->data, vc->rx, packet->len);
+	}
 	if (ret)
 		return ret;
 	if (n != 32 || le32_to_cpu(w[0]) != VC_BOOT_MAGIC0 ||
@@ -815,6 +884,50 @@ static int vc_rx_boot(struct vc *vc, u32 *type, u32 *value)
 	*type = le32_to_cpu(w[1]) >> 24;
 	*value = le32_to_cpu(w[1]) & 0xffffff;
 	return 0;
+}
+
+static void vc_boot_trace_dump(struct vc *vc, int result)
+{
+	u32 i, j, count = vc->boot_status_count;
+
+	vc->boot_trace = false;
+	dev_info(vc->dev,
+		 "bootdiag-v1: result=%d stages=%u status_reads=%u chunks=%u HZ=%u dma=%u loader_b=%u; first16/last240 statuses; no extra MMIO reads\n",
+		 result, vc->boot_stage, count, vc->boot_chunk_count,
+		 HZ, dma, loader_b);
+	for (i = 0; i < count; i++) {
+		u32 slot;
+		struct vc_boot_status *s;
+
+		if (i >= 16 && count > 256 && i < count - 240) {
+			i = count - 240 - 1;
+			continue;
+		}
+		slot = i < 16 ? i : 16 + (i - 16) % 240;
+		s = &vc->boot_status[slot];
+		dev_info(vc->dev,
+			 "bootdiag: status #%u t=%u stage=%u prev=%08x raw=%04x/%04x final=%04x/%04x resync=%x ret=%d\n",
+			 s->seq, s->ticks, s->stage, s->previous,
+			 s->raw_a, s->raw_b, s->a, s->b, s->flags, s->ret);
+	}
+	for (i = 0; i < min_t(u32, vc->boot_chunk_count,
+			      ARRAY_SIZE(vc->boot_chunks)); i++) {
+		struct vc_boot_chunk *c = &vc->boot_chunks[i];
+
+		dev_info(vc->dev,
+			 "bootdiag: chunk #%u stage=%u status=%08x offset=%u count=%u\n",
+			 i, c->stage, c->status, c->offset, c->count);
+	}
+	for (i = 0; i < min_t(u32, vc->boot_stage,
+			      ARRAY_SIZE(vc->boot_packets)); i++) {
+		struct vc_boot_packet *p = &vc->boot_packets[i];
+
+		dev_info(vc->dev, "bootdiag: packet stage=%u rx_ret=%d bytes=%u\n",
+			 i + 1, p->ret, p->len);
+		for (j = 0; j < p->len; j += 32)
+			dev_info(vc->dev, "bootdiag: data stage=%u +%04x: %*ph\n",
+				 i + 1, j, min_t(u32, 32, p->len - j), p->data + j);
+	}
 }
 
 static int vc_send_image(struct vc *vc, const char *name)
@@ -2359,7 +2472,10 @@ static int vc_thread(void *arg)
 	bool is_cold = false;
 	int ret;
 
+	vc->boot_started = jiffies;
+	vc->boot_trace = true;
 	ret = vc_boot(vc);
+	vc->boot_trace = false;
 	if (!ret)
 		ret = vchi_connect(vc);
 	if (!ret)
@@ -2383,6 +2499,7 @@ static int vc_thread(void *arg)
 		if (!ret)
 			ret = vc_display_setup(vc);
 	}
+	vc_boot_trace_dump(vc, ret);
 	if (ret) {
 		dev_err(vc->dev, "VideoCore bring-up failed: %d\n", ret);
 		/* stay around for kthread_stop() */
